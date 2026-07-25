@@ -25,6 +25,10 @@ def is_cpu_device_backend(target: Target):
     return target.kind.name == "c"
 
 
+def is_tile_backend(target: Target):
+    return "tile" in target.keys
+
+
 def has_device_kernel_launch(attrs) -> bool:
     """Check if the attributes indicate a device kernel launch."""
     return bool(attrs and "calling_conv" in attrs and attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH)
@@ -239,7 +243,10 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
     return resolve_host_codegen(target_host).lower(host_mod, target_host)
 
 
-def _prepare_device_codegen_mod(device_mod: tvm.IRModule) -> tvm.IRModule:
+def _prepare_device_codegen_mod(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    if is_tile_backend(target):
+        return device_mod
+
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tirx.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
@@ -247,12 +254,12 @@ def _prepare_device_codegen_mod(device_mod: tvm.IRModule) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
-    device_mod = _prepare_device_codegen_mod(device_mod)
+    device_mod = _prepare_device_codegen_mod(device_mod, target)
     return resolve_device_codegen(target).lower(device_mod, target, compile_device=True)
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
-    device_mod = _prepare_device_codegen_mod(device_mod)
+    device_mod = _prepare_device_codegen_mod(device_mod, target)
     return resolve_device_codegen(target).lower(device_mod, target, compile_device=False)
 
 
@@ -273,6 +280,17 @@ def lower_to_host_device_ir(
 
     if isinstance(target, str):
         target = determine_target(target)
+
+    resolved_target = tvm.target.Target(target)
+    if is_tile_backend(resolved_target):
+        with resolved_target:
+            pipeline = resolve_pipeline(resolved_target)
+            mod = pipeline.lower(mod, resolved_target)
+        # Keep the complete lowered module intact; the empty host module only
+        # preserves the existing lower_to_host_device_ir return contract.
+        empty_host_mod = tvm.IRModule({})
+        target_host = tvm.target.Target(canon_target_host(resolved_target, target_host))
+        return empty_host_mod, mod, params, resolved_target, target_host
 
     target_host = canon_target_host(target, target_host)
 
