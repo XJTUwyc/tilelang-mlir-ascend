@@ -29,8 +29,8 @@ _PIPELINES: dict[str, PassPipeline] = {}
 def register_pipeline(pipeline: PassPipeline) -> PassPipeline:
     """Register a lowering pipeline for a backend.
 
-    The pipeline name should match ``target.kind.name`` (e.g. ``"cuda"``,
-    ``"hip"``, ``"c"``, ``"llvm"``).
+    The pipeline name normally matches ``target.kind.name``. Backends that
+    share a target kind can use a target key as their pipeline name.
     """
     _PIPELINES[pipeline.name] = pipeline
     return pipeline
@@ -45,4 +45,6 @@ def get_pipeline(name: str) -> PassPipeline:
 
 def resolve_pipeline(target: Target) -> PassPipeline:
     """Resolve the lowering pipeline from a TVM target."""
+    if "tile" in target.keys and "tile" in _PIPELINES:
+        return get_pipeline("tile")
     return get_pipeline(target.kind.name)
