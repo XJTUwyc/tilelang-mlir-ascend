@@ -107,4 +107,12 @@ def resolve_device_codegen(target: Target) -> DeviceCodegen:
         target_kind = target.kind.name
         options = _format_codegen_names(_DEVICE_CODEGENS.get(target_kind, []))
         raise ValueError(f"No device codegen registered for target '{target_kind}'. Available: {options}.")
+
+    # Prefer a target-specific match over a generic fallback registered for
+    # the same TVM target kind, such as OpenTile and CPU both using "c".
+    specific_matches = [
+        codegen for codegen in matches if codegen.supports_target is not None
+    ]
+    if specific_matches:
+        return specific_matches[0]
     return matches[0]
