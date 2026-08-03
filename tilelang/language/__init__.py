@@ -26,6 +26,18 @@ from .loop import (
     Unroll,  # noqa: F401
     Vectorized,  # noqa: F401
 )
+from .scope import SimdVF  # noqa: F401
+from .simd import (  # noqa: F401
+    vadd,
+    vcvt,
+    vexp,
+    vexpdif,
+    vmax,
+    vmul,
+    vmuls,
+    vreduce_max,
+    vreduce_sum,
+)
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401
 from .kernel import (
@@ -44,6 +56,7 @@ from .allocate import (
     alloc_local,  # noqa: F401
     alloc_shared,  # noqa: F401
     alloc_fragment,  # noqa: F401
+    alloc_fragment as alloc_frag,  # noqa: F401
     alloc_global,  # noqa: F401
     alloc_barrier,  # noqa: F401
     alloc_cluster_barrier,  # noqa: F401
