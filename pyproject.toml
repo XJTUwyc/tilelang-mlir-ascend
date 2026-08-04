@@ -42,6 +42,9 @@ dependencies = [
     "tqdm>=4.62.3",
     "typing-extensions>=4.10.0",
     "z3-solver>=4.13.0,<4.15.5",
+    # The official implementation is resolved from https://llvm.github.io/eudsl.
+    # Pass that URL with pip's -f option when installing a TileLang wheel.
+    "mlir-python-bindings",
 ]
 
 [project.optional-dependencies]
@@ -152,6 +155,7 @@ exclude = [
 
 [tool.scikit-build.wheel.packages]
 tilelang = "tilelang"
+tilelangir = "tilelangir"
 "tilelang/src" = "src"
 # NOTE: The mapping below places the contents of '3rdparty' inside 'tilelang/3rdparty' in the wheel.
 # This is necessary to find TVM shared libraries at runtime.

@@ -1,5 +1,0 @@
-file(GLOB TILE_LANG_OPENTILE_SRCS
-  src/opentile/codegen/*.cc
-)
-
-list(APPEND TILE_LANG_SRCS ${TILE_LANG_OPENTILE_SRCS})
