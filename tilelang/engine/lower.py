@@ -336,6 +336,8 @@ def lower(
 
     codegen_mod = device_codegen(device_mod, target) if enable_device_compile else device_codegen_without_compile(device_mod, target)
     kernel_source = codegen_mod.inspect_source()
+    if is_tile_backend(target):
+        print(f"codegen:\n{kernel_source}")
 
     if enable_host_codegen:
         host_mod = host_codegen(host_mod, target_host, target=target)
