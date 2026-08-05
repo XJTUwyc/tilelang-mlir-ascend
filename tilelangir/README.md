@@ -74,13 +74,65 @@ Python Codegen，而不是已删除的 `src/opentile` C++ Codegen。
 Translator 接收 `tvm.IRModule`，直接访问其中的 `PrimFunc`、`Stmt`、`PrimExpr`、
 `Buffer` 和 `Call` 等 TIRX Python ObjectRef。
 
-Translator 根据节点的 Python 类型分派普通 TIRX 节点，并根据 `Call.op.name`
-分派 `tl.tileop.copy`、`tl.tileop.gemm` 等 TileLang Operation。转换过程中维护：
+Translator 使用 TVM `PyStmtExprVisitor` 根据实际节点类型分派普通 TIRX 节点，
+并根据 `Call.op.name` 分派 `tl.tileop.copy`、`tl.tileop.gemm` 等 TileLang
+Operation。转换过程中维护：
 
 - TIRX `Var` 到 MLIR SSA Value 的映射;TIRX `Buffer` 到 MLIR memref Value 的映射；
 - TIRX Region 到 MLIR Region/Block 的嵌套关系；
 - dtype、shape、scope、annotation 和符号信息的转换结果。
 
+#### `tvm.IRModule` 数据结构与遍历方法
+
+TIRX 节点首先按照接口类型分为 `Stmt`、`PrimExpr` 等大类，再细分为具体
+节点类型。例如，`Stmt` 包含 `For`、`SBlock`、`Evaluate` 等节点，
+`PrimExpr` 包含 `Add`、`BufferLoad`、`Call` 等节点。`Buffer` 等对象也是
+TIRX ObjectRef，但不属于 `Stmt` 或 `PrimExpr`，由引用它们的节点处理函数读取。
+
+Translator 从 `PrimFunc.body` 开始一次 DFS。`visit_stmt()` 和 `visit_expr()`
+都是 TVM `PyStmtExprVisitor` 直接提供的遍历函数，分别接收 `Stmt` 和
+`PrimExpr`。它们在内部根据节点的具体类型 dispatch 到固定名称的处理函数。
+`visit_for_()`、`visit_sblock_()`、`visit_call_()` 等处理函数由 Translator
+按需重新实现；覆盖以后，当前节点的处理和是否继续访问子节点都由覆盖函数负责。
+
+```text
+按照节点的大类选择 TVM 遍历函数
+    ├── 节点是 Stmt     → visit_stmt(child_stmt)
+    └── 节点是 PrimExpr → visit_expr(child_expr)
+    ....
+                                  ↓
+TVM的visit_stmt和visit_expr实现，会按具体节点类型 dispatch
+    ├── For        → visit_for_()
+    ├── SBlock     → visit_sblock_()
+    ├── Evaluate   → visit_evaluate_()
+    ├── Add        → visit_add_()
+    ├── BufferLoad → visit_buffer_load_()
+    └── Call       → visit_call_()
+    .....
+上述函数，覆盖固定名称的 visit_xxx_()，即可替代tvm原生处理方案，来处理改类节点
+                                  ↓
+继续 DFS：子 Stmt 调用 visit_stmt()，子 PrimExpr 调用 visit_expr(),...
+```
+注意，上述的TVM 按具体节点类型 dispatch里面，节点dispatch分为两种：
+```text
+TVM/TIRX 原生具体节点
+    → 根据节点类型分派到固定的 visit_xxx_()
+
+TileLang 新注册的 tl.tileop.*
+    → 不产生新的 TIRX 节点类型
+    → 统一属于 tirx.CallNode
+```
+因此，对于新注册的节点：
+例如 `T.vadd` 注册的是名为 `tl.tileop.vadd` 的 `Op`，而不是新的
+`VAddNode`。它属于visit_call_遍历的节点的某个参数
+
+因此，`AddNode → visit_add_()` 表示 TIRX 原生标量加法节点的类型分派，
+不表示 `T.vadd` 的处理路径。`T.copy`、`T.gemm` 和其他在src/op内注册的 `tl.tileop.*`,
+也采用相同的 `CallNode + Call.op.name` 二次分派方式。
+
+对于原生的节点：
+未覆盖某个 `visit_xxx_()` 时，TVM 使用默认实现，不生成 TileLangIR，只按照
+节点结构继续访问子 `Stmt` 和子 `PrimExpr`。覆盖以后，默认实现被替换
 ### 3. 使用 MLIR Python bindings 构造结果
 
 TileLangIR Codegen 在运行时导入 `mlir.ir`，通过 Python Builder API 创建 Context、
