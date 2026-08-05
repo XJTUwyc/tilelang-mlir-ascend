@@ -2,7 +2,8 @@
 
 This directory is the source-level contract for downstream MLIR compilers.
 TileLang's Python package does not compile or load this dialect: it emits the
-same `tilelang.*` operations in generic MLIR assembly.
+same `tilelang.*` operations in generic MLIR assembly via
+`tilelangir/_tilelang_ops_gen.py`.
 
 ## Consume from a downstream MLIR project
 
@@ -30,12 +31,21 @@ IR.
 
 ## Compatibility contract
 
-The generic MLIR operation names, region order, and attribute names/types in
-`TileLangOps.td` are the public interchange contract. Keep them synchronized
-with `tilelangir/_tilelang_ops_gen.py`.
+The generic MLIR operation names, operand order/types, region order, and
+attribute names/types in `TileLangOps.td` are the public interchange contract.
+**Keep them synchronized with `tilelangir/_tilelang_ops_gen.py`.**
 
-| Operation | Regions | Optional attributes |
-| --- | --- | --- |
-| `tilelang.copy` | `source`, `dest` | `split_dim: i64`, `transpose: unit` |
-| `tilelang.gemm` | `a_region`, `b_region`, `c_region` | `transpose_a: unit`, `transpose_b: unit`, `m: i64`, `n: i64`, `k: i64`, `clear_accum: unit` |
-| `tilelang.launch_thread` | `body` | `thread_tag: string`, `extent: i64` |
+| Operation | Operands | Regions | Optional attributes |
+| --- | --- | --- | --- |
+| `tilelang.copy` | `src: AnyMemRef`, `dest: AnyMemRef` | none | `split_dim: i64`, `transpose: unit` |
+| `tilelang.gemm` | `a: AnyMemRef`, `b: AnyMemRef`, `c: AnyMemRef` | none | `transpose_a: unit`, `transpose_b: unit`, `m: i64`, `n: i64`, `k: i64`, `clear_accum: unit` |
+| `tilelang.scope` | none | `body` | `simd_attr: string` |
+
+### Architecture notes (tile backend)
+
+- Only `blockIdx.x` is effective. It is **not** modeled as a dialect op: the
+  translator emits an extra `i32` function argument and a function attribute
+  `BlockIdx: i64` (grid extent).
+- `threadIdx.*` bindings are ignored by codegen.
+- `tilelang.launch_thread` has been removed from both the Python OpViews and
+  this TableGen contract.
