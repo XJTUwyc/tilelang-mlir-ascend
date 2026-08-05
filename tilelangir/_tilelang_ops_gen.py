@@ -3,15 +3,12 @@
 
 from mlir.dialects._ods_common import _cext as _ods_cext
 from mlir.dialects._ods_common import (
-    equally_sized_accessor as _ods_equally_sized_accessor,
     get_default_loc_context as _ods_get_default_loc_context,
-    get_op_results_or_values as _get_op_results_or_values,
-    segmented_accessor as _ods_segmented_accessor,
 )
 _ods_ir = _ods_cext.ir
 
 import builtins
-from typing import Any as _Any, Sequence as _Sequence, Union as _Union, Optional as _Optional
+from typing import Optional as _Optional
 
 
 # ---------------------------------------------------------------------------
@@ -29,12 +26,21 @@ class _Dialect(_ods_ir.Dialect):
 
 @_ods_cext.register_operation(_Dialect)
 class CopyOp(_ods_ir.OpView):
+    """Copy between two memref/view SSA values.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.copy"(%src, %dst) : (memref<...>, memref<...>) -> ()
+    """
+
     OPERATION_NAME = "tilelang.copy"
 
-    _ODS_REGIONS = (2, True)
+    _ODS_REGIONS = (0, True)
 
     def __init__(
         self,
+        src,
+        dest,
         *,
         split_dim: _Optional[int] = None,
         transpose: _Optional[bool] = None,
@@ -57,7 +63,7 @@ class CopyOp(_ods_ir.OpView):
             None,  # _ODS_RESULT_SEGMENTS
             attributes=attributes,
             results=[],
-            operands=[],
+            operands=[src, dest],
             successors=None,
             regions=None,
             loc=loc,
@@ -65,12 +71,12 @@ class CopyOp(_ods_ir.OpView):
         )
 
     @builtins.property
-    def source(self) -> _ods_ir.Region:
-        return self.regions[0]
+    def src(self):
+        return self.operation.operands[0]
 
     @builtins.property
-    def dest(self) -> _ods_ir.Region:
-        return self.regions[1]
+    def dest(self):
+        return self.operation.operands[1]
 
     @builtins.property
     def split_dim(self) -> _Optional[int]:
@@ -107,10 +113,13 @@ class CopyOp(_ods_ir.OpView):
 class GemmOp(_ods_ir.OpView):
     OPERATION_NAME = "tilelang.gemm"
 
-    _ODS_REGIONS = (3, True)
+    _ODS_REGIONS = (0, True)
 
     def __init__(
         self,
+        a,
+        b,
+        c,
         *,
         transpose_a: _Optional[bool] = None,
         transpose_b: _Optional[bool] = None,
@@ -148,7 +157,7 @@ class GemmOp(_ods_ir.OpView):
             None,
             attributes=attributes,
             results=[],
-            operands=[],
+            operands=[a, b, c],
             successors=None,
             regions=None,
             loc=loc,
@@ -156,16 +165,16 @@ class GemmOp(_ods_ir.OpView):
         )
 
     @builtins.property
-    def a_region(self) -> _ods_ir.Region:
-        return self.regions[0]
+    def a(self):
+        return self.operation.operands[0]
 
     @builtins.property
-    def b_region(self) -> _ods_ir.Region:
-        return self.regions[1]
+    def b(self):
+        return self.operation.operands[1]
 
     @builtins.property
-    def c_region(self) -> _ods_ir.Region:
-        return self.regions[2]
+    def c(self):
+        return self.operation.operands[2]
 
     @builtins.property
     def transpose_a(self) -> bool:
@@ -247,30 +256,32 @@ class GemmOp(_ods_ir.OpView):
 
 
 # ===========================================================================
-# tilelang.launch_thread
+# tilelang.scope
 # ===========================================================================
 
 @_ods_cext.register_operation(_Dialect)
-class LaunchThreadOp(_ods_ir.OpView):
-    OPERATION_NAME = "tilelang.launch_thread"
+class ScopeOp(_ods_ir.OpView):
+    """Scope region used for SimdVF and similar frontend scopes.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.scope"() ({ ... }) {simd_attr = "simd"} : () -> ()
+    """
+
+    OPERATION_NAME = "tilelang.scope"
 
     _ODS_REGIONS = (1, True)
 
     def __init__(
         self,
         *,
-        thread_tag: _Optional[str] = None,
-        extent: _Optional[int] = None,
+        simd_attr: _Optional[str] = None,
         loc: _Optional[_ods_ir.Location] = None,
         ip: _Optional[_ods_ir.InsertionPoint] = None,
     ):
         attributes: dict = {}
-        if thread_tag is not None:
-            attributes["thread_tag"] = _ods_ir.StringAttr.get(thread_tag)
-        if extent is not None:
-            attributes["extent"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), extent
-            )
+        if simd_attr is not None:
+            attributes["simd_attr"] = _ods_ir.StringAttr.get(simd_attr)
         super().__init__(
             self.OPERATION_NAME,
             self._ODS_REGIONS,
@@ -290,29 +301,14 @@ class LaunchThreadOp(_ods_ir.OpView):
         return self.regions[0]
 
     @builtins.property
-    def thread_tag(self) -> _Optional[str]:
-        if "thread_tag" not in self.operation.attributes:
+    def simd_attr(self) -> _Optional[str]:
+        if "simd_attr" not in self.operation.attributes:
             return None
-        return _ods_ir.StringAttr(self.operation.attributes["thread_tag"]).value
+        return _ods_ir.StringAttr(self.operation.attributes["simd_attr"]).value
 
-    @thread_tag.setter
-    def thread_tag(self, value: _Optional[str]):
+    @simd_attr.setter
+    def simd_attr(self, value: _Optional[str]):
         if value is not None:
-            self.operation.attributes["thread_tag"] = _ods_ir.StringAttr.get(value)
-        elif "thread_tag" in self.operation.attributes:
-            del self.operation.attributes["thread_tag"]
-
-    @builtins.property
-    def extent(self) -> _Optional[int]:
-        if "extent" not in self.operation.attributes:
-            return None
-        return _ods_ir.IntegerAttr(self.operation.attributes["extent"]).value
-
-    @extent.setter
-    def extent(self, value: _Optional[int]):
-        if value is not None:
-            self.operation.attributes["extent"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), value
-            )
-        elif "extent" in self.operation.attributes:
-            del self.operation.attributes["extent"]
+            self.operation.attributes["simd_attr"] = _ods_ir.StringAttr.get(value)
+        elif "simd_attr" in self.operation.attributes:
+            del self.operation.attributes["simd_attr"]
