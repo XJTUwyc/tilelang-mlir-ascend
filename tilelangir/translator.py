@@ -204,6 +204,32 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._insert_value(buffer, typed)
         return typed
 
+    def _emit_linear_offset(
+        self,
+        buffer: Any,
+        indices: list[tirx.PrimExpr],
+        buffer_strides: list[int],
+    ) -> Any:
+        if isinstance(buffer.elem_offset, tirx.IntImm) and all(
+            isinstance(index, tirx.IntImm) for index in indices
+        ):
+            offset = int(buffer.elem_offset.value)
+            offset += sum(
+                int(index.value) * stride for index, stride in zip(indices, buffer_strides)
+            )
+            return offset
+
+        index_type = self._ir.IndexType.get()
+        offset = self._cast_to_index(self._get_or_create_expr_value(buffer.elem_offset))
+        for index, stride in zip(indices, buffer_strides):
+            index_value = self._cast_to_index(self._get_or_create_expr_value(index))
+            stride_value = self._arith.ConstantOp(
+                index_type, self._ir.IntegerAttr.get(index_type, stride)
+            ).result
+            scaled_index = self._arith.MulIOp(index_value, stride_value).result
+            offset = self._arith.AddIOp(offset, scaled_index).result
+        return offset
+
     def _emit_region(self, call: tirx.Call) -> Any:
         if len(call.args) < 3:
             raise ValueError("tl.tileop.region expects BufferLoad, access type, and extents")
@@ -219,17 +245,13 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         backing = self._get_value(buffer)
         buffer_shape = self._static_shape(buffer)
         buffer_strides = self._buffer_strides(buffer, buffer_shape)
-        indices = [
-            self._static_int(index, f"{buffer.name} region index") for index in buffer_load.indices
-        ]
+        indices = list(buffer_load.indices)
         if len(indices) != len(buffer_strides):
             raise ValueError(
                 f"Region rank mismatch for {buffer.name}: "
                 f"{len(indices)} indices for rank-{len(buffer_strides)} Buffer."
             )
 
-        offset = self._static_int(buffer.elem_offset, f"{buffer.name}.elem_offset")
-        offset += sum(index * stride for index, stride in zip(indices, buffer_strides))
         sizes = [self._static_int(extent, f"{buffer.name} region extent") for extent in call.args[2:]]
         if len(sizes) > len(buffer_strides):
             raise ValueError(
@@ -237,7 +259,18 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"{len(sizes)} extents for rank-{len(buffer_strides)} Buffer."
             )
         strides = buffer_strides[-len(sizes) :]
-        layout = self._ir.StridedLayoutAttr.get(offset, strides)
+        offset = self._emit_linear_offset(buffer, indices, buffer_strides)
+        dynamic = self._ir.ShapedType.get_dynamic_size()
+        if isinstance(offset, int):
+            dynamic_offsets = []
+            static_offsets = [offset]
+            layout_offset = offset
+        else:
+            dynamic_offsets = [offset]
+            static_offsets = [dynamic]
+            layout_offset = dynamic
+
+        layout = self._ir.StridedLayoutAttr.get(layout_offset, strides)
         result_type = self._ir.MemRefType.get(
             sizes,
             self._dtype_type(buffer.dtype),
@@ -247,10 +280,10 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         view_op = self._memref.ReinterpretCastOp(
             result_type,
             backing,
+            dynamic_offsets,
             [],
             [],
-            [],
-            [offset],
+            static_offsets,
             sizes,
             strides,
         )
@@ -260,13 +293,18 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     def _emit_vadd(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(f"tl.tileop.vadd expects 3 arguments, but received {len(call.args)}")
-        for operand in call.args:
-            self.visit_expr(operand)
-
-        src0 = self._get_value(call.args[0])
-        src1 = self._get_value(call.args[1])
-        dst = self._get_value(call.args[2])
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
+
+    def _cast_to_index(self, value: Any) -> Any:
+        index_type = self._ir.IndexType.get()
+        if value.type == index_type:
+            return value
+        if isinstance(value.type, self._ir.IntegerType):
+            return self._arith.IndexCastOp(index_type, value).result
+        raise TypeError(f"Cannot cast MLIR value of type {value.type} to index.")
 
     def _memory_scope(self, buffer: Any) -> Any:
         scope = str(buffer.scope())
@@ -353,6 +391,22 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         except KeyError as exc:
             raise KeyError(f"TIRX value has not been lowered yet: {tirx_object}") from exc
 
+    def _get_or_create_expr_value(self, expr: tirx.PrimExpr) -> Any:
+        """Get or emit the MLIR Value represented by a TIRX PrimExpr."""
+
+        if expr in self.value_map:
+            return self._get_value(expr)
+
+        self.visit_expr(expr)
+
+        try:
+            return self._get_value(expr)
+        except KeyError as exc:
+            raise NotImplementedError(
+                "TIRX expression lowering did not produce an MLIR Value for "
+                f"{type(expr).__name__}: {expr}"
+            ) from exc
+
     #############
     # Overridden visitor methods
     #############
@@ -373,6 +427,42 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self.visit_stmt(op.body)
 
     # The following methods are dispatched by visit_expr.
+    def visit_var_(self, op: tirx.Var) -> None:
+        raise KeyError(f"TIRX Var has not been bound to an MLIR Value: {op.name}")
+
+    def visit_int_imm_(self, op: tirx.IntImm) -> None:
+        result_type = self._dtype_type(op.dtype)
+        value = self._arith.ConstantOp(
+            result_type,
+            self._ir.IntegerAttr.get(result_type, int(op.value)),
+        ).result
+        self._insert_value(op, value)
+
+    def visit_float_imm_(self, op: tirx.FloatImm) -> None:
+        result_type = self._dtype_type(op.dtype)
+        value = self._arith.ConstantOp(
+            result_type,
+            self._ir.FloatAttr.get(result_type, float(op.value)),
+        ).result
+        self._insert_value(op, value)
+
+    def visit_add_(self, op: tirx.Add) -> None:
+        lhs = self._get_or_create_expr_value(op.a)
+        rhs = self._get_or_create_expr_value(op.b)
+        self._insert_value(op, self._arith.AddIOp(lhs, rhs).result)
+
+    def visit_sub_(self, op: tirx.Sub) -> None:
+        lhs = self._get_or_create_expr_value(op.a)
+        rhs = self._get_or_create_expr_value(op.b)
+        self._insert_value(op, self._arith.SubIOp(lhs, rhs).result)
+
+    def visit_mul_(self, op: tirx.Mul) -> None:
+        lhs = self._get_or_create_expr_value(op.a)
+        rhs = self._get_or_create_expr_value(op.b)
+        self._insert_value(op, self._arith.MulIOp(lhs, rhs).result)
+
+    # Add all handlers for native TIRX expressions here.
+
     # Operations registered under src/op are represented as Call nodes.
     def visit_call_(self, op: tirx.Call) -> None:
         op_name = self._call_op_name(op)

@@ -13,14 +13,17 @@
 | `PrimFunc` | `func.func` | 函数参数、返回值和符号信息保持可追踪。 |
 | `Buffer`、函数 Buffer 参数 | `memref` 类型 | 保留 shape、dtype 和动态维度。 |
 | Buffer 分配 | `memref.alloc` 或 `memref.alloca` | 根据分配生命周期选择；内存 scope 作为内建 StringAttr 附在分配操作上。 |
-| `BufferLoad` | `memref.load` | 索引表达式先转换为对应的 MLIR SSA Value。 |
-| `BufferStore` | `memref.store` | 保持原始写入位置和执行顺序。 |
-| Buffer Region、切片 | `memref.subview` | 保留 offset、size 和 stride。 |
+| 普通标量表达式中的 `BufferLoad` | `memref.load` | 读取单个元素；`tl.tileop.region` 内嵌的 `BufferLoad` 不属于这种情况。 |
+| 普通标量赋值中的 `BufferStore` | `memref.store` | 写入单个元素；当前实现需要先具备对应的 For 和 BufferLoad 支持。 |
+| `tl.tileop.region` | `memref.reinterpret_cast` | 将内嵌 `BufferLoad` 拆为原始 Buffer 和起始索引，保留 offset、size 和 stride。 |
 | 整数、浮点数和布尔常量 | `arith.constant` | 保留原始 dtype。 |
 | 加减乘除、比较、选择和类型转换 | `arith` 方言 | 根据整数、浮点数和有无符号语义选择对应 Operation。 |
 | `exp` 等数学表达式 | `math` 方言 | 使用已有数学 Operation。 |
-| Serial `For` | `scf.for` | 保留 min、extent、step 和循环体。 |
-| Parallel `For` | `scf.parallel` | 保留并行维度，不在 Codegen 中改变调度。 |
+| Serial `For` | `scf.for` | 保留 min、extent、step 和循环体，并增加 `tilelang.loop_kind = "serial"`。 |
+| Parallel `For` | `scf.for` | 增加 `tilelang.loop_kind = "parallel"`，并原样保留循环 annotations。 |
+| Vectorized `For` | `scf.for` | 增加 `tilelang.loop_kind = "vectorized"`，并原样保留循环 annotations。 |
+| Unrolled `For` | `scf.for` | 增加 `tilelang.loop_kind = "unrolled"`，并原样保留 unroll factor 等 annotations。 |
+| Pipelined `For` | `scf.for` | TIRX 中实际是 Serial `For`；根据 pipeline annotations 识别，增加 `tilelang.loop_kind = "pipelined"`，并原样保留 `num_stages`、`tl_pipeline_order`、`tl_pipeline_stage` 和 `tl_pipeline_group`。 |
 | 条件语句 | `scf.if` | 保留 then/else Region。 |
 | `SBlock` | `scf.execute_region` | 在 Operation 上增加 `tilelang.sblock_name` 等普通 Attribute；不转换自动推导的 `reads`/`writes`。 |
 | `SimdVF` | `scf.execute_region` | 增加表示 SimdVF scope 的普通 Attribute。 |
