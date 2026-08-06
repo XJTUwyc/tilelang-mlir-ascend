@@ -8,7 +8,7 @@ from tvm import IRModule, tirx
 from tvm.tirx import PrimFunc, PyStmtExprVisitor
 
 from .dialect import configure_context
-from ._tilelang_ops_gen import CopyOp, GemmOp, LaunchThreadOp
+from ._tilelang_ops_gen import CopyOp, GemmOp, ScopeOp
 
 
 @tirx.functor.visitor
