@@ -398,6 +398,31 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             transpose=True if self._as_bool(ann.get("transpose", False)) else None,
         )
 
+    def _emit_gemm(self, call: tirx.Call) -> None:
+        # T.gemm Call arg layout (see tilelang/language/gemm_op.py):
+        #   0: A region, 1: B region, 2: C region,
+        #   3: transpose_A (bool), 4: transpose_B (bool),
+        #   5: M, 6: N, 7: K, 8: policy,
+        #   9: clear_accum (bool), 10-18: strides/offsets/etc (unused by GemmOp)
+        if len(call.args) < 10:
+            raise ValueError(
+                f"tl.tileop.gemm expects at least 10 arguments, but received {len(call.args)}"
+            )
+        a = self._get_or_create_expr_value(call.args[0])
+        b = self._get_or_create_expr_value(call.args[1])
+        c = self._get_or_create_expr_value(call.args[2])
+        transpose_a = self._as_bool(call.args[3])
+        transpose_b = self._as_bool(call.args[4])
+        clear_accum = self._as_bool(call.args[9])
+        GemmOp(
+            a,
+            b,
+            c,
+            transpose_a=transpose_a,
+            transpose_b=transpose_b,
+            clear_accum=clear_accum,
+        )
+
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
         if value.type == index_type:
@@ -766,6 +791,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_vadd(op)
         elif op_name == "tl.tileop.copy":
             self._emit_copy(op)
+        elif op_name == "tl.tileop.gemm":
+            self._emit_gemm(op)
 
     @staticmethod
     def _call_annotations(call: tirx.Call) -> dict[str, Any]:
