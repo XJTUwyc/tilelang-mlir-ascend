@@ -397,6 +397,11 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     def _get_or_create_expr_value(self, expr: tirx.PrimExpr) -> Any:
         """Get or emit the MLIR Value represented by a TIRX PrimExpr."""
 
+        if isinstance(expr, tirx.IntImm):
+            return self._emit_int_imm_value(expr)
+        if isinstance(expr, tirx.FloatImm):
+            return self._emit_float_imm_value(expr)
+
         if expr in self.value_map:
             return self._get_value(expr)
 
@@ -516,21 +521,25 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     def visit_var_(self, op: tirx.Var) -> None:
         raise KeyError(f"TIRX Var has not been bound to an MLIR Value: {op.name}")
 
-    def visit_int_imm_(self, op: tirx.IntImm) -> None:
+    def _emit_int_imm_value(self, op: tirx.IntImm) -> Any:
         result_type = self._dtype_type(op.dtype)
-        value = self._arith.ConstantOp(
+        return self._arith.ConstantOp(
             result_type,
             self._ir.IntegerAttr.get(result_type, int(op.value)),
         ).result
-        self._insert_value(op, value)
 
-    def visit_float_imm_(self, op: tirx.FloatImm) -> None:
+    def _emit_float_imm_value(self, op: tirx.FloatImm) -> Any:
         result_type = self._dtype_type(op.dtype)
-        value = self._arith.ConstantOp(
+        return self._arith.ConstantOp(
             result_type,
             self._ir.FloatAttr.get(result_type, float(op.value)),
         ).result
-        self._insert_value(op, value)
+
+    def visit_int_imm_(self, op: tirx.IntImm) -> None:
+        self._emit_int_imm_value(op)
+
+    def visit_float_imm_(self, op: tirx.FloatImm) -> None:
+        self._emit_float_imm_value(op)
 
     def visit_buffer_load_(self, op: tirx.BufferLoad) -> None:
         """
