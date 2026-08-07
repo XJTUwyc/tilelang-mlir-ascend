@@ -89,10 +89,16 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         """Emit one function and materialize its TIRX Buffer parameters."""
 
         self.value_map.clear()
+        block_idx_bindings = self._collect_block_idx_bindings(prim_func.body)
+
         # 1. Parse the function parameters and create the MLIR function
         input_types = [self._parameter_type(param, prim_func) for param in prim_func.params]
+        arg_base = len(input_types)
+        i32_type = self._ir.IntegerType.get_signless(32)
+        input_types.extend(i32_type for _ in block_idx_bindings)
         function_type = self._ir.FunctionType.get(input_types, [])
         function_op = self._func.FuncOp(name, function_type)
+        self._set_block_idx_attr(function_op, block_idx_bindings, arg_base)
         entry_block = function_op.add_entry_block()
 
         # 2. Set the MLIR insertion point inside func.func
@@ -107,6 +113,9 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             for param in prim_func.params:
                 if param in prim_func.buffer_map:
                     self._emit_parameter_buffer(prim_func.buffer_map[param])
+
+            for offset, (var, _extent, _tag) in enumerate(block_idx_bindings):
+                self._insert_value(var, entry_block.arguments[arg_base + offset])
 
             # 4. Traverse the TIRX tree
             self.visit_stmt(prim_func.body)
@@ -125,6 +134,51 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._dtype_type(buffer.dtype),
             memory_space=self._memory_scope(buffer),
         )
+
+    @staticmethod
+    def _collect_block_idx_bindings(body: Any) -> list[tuple[Any, Any, str]]:
+        bindings: list[tuple[Any, Any, str]] = []
+        seen: set[int] = set()
+
+        @tirx.functor.visitor
+        class Collector(PyStmtExprVisitor):
+            def visit_attr_stmt_(self, op: tirx.AttrStmt) -> None:
+                if str(op.attr_key) == "thread_extent":
+                    node = op.node
+                    tag = str(getattr(node, "thread_tag", "") or "")
+                    var = getattr(node, "var", None)
+                    if tag.startswith("blockIdx.") and var is not None:
+                        key = id(var)
+                        if key not in seen:
+                            seen.add(key)
+                            bindings.append((var, op.value, tag))
+                self.visit_stmt(op.body)
+
+        Collector().visit_stmt(body)
+        order = {"blockIdx.x": 0, "blockIdx.y": 1, "blockIdx.z": 2}
+        bindings.sort(key=lambda item: order.get(item[2], 99))
+        return bindings
+
+    def _set_block_idx_attr(
+        self,
+        function_op: Any,
+        block_idx_bindings: list[tuple[Any, Any, str]],
+        arg_base: int,
+    ) -> None:
+        """Record which `func.func` argument carries `blockIdx.x`.
+
+        Downstream reads the block index from a hardware instruction rather than
+        from the launch grid, so the attribute is a parameter position, not the
+        grid extent.
+        """
+        for offset, (_var, _extent, tag) in enumerate(block_idx_bindings):
+            if tag != "blockIdx.x":
+                continue
+            i64 = self._ir.IntegerType.get_signless(64)
+            function_op.attributes["BlockIdx"] = self._ir.IntegerAttr.get(
+                i64, arg_base + offset
+            )
+            return
 
     def _emit_parameter_buffer(self, buffer: Any) -> Any:
         backing = self._get_value(buffer.data)
@@ -255,13 +309,15 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"{len(indices)} indices for rank-{len(buffer_strides)} Buffer."
             )
 
-        sizes = [self._static_int(extent, f"{buffer.name} region extent") for extent in call.args[2:]]
-        if len(sizes) > len(buffer_strides):
+        raw_extents = list(call.args[2:])
+        if len(raw_extents) > len(buffer_strides):
             raise ValueError(
                 f"Region rank mismatch for {buffer.name}: "
-                f"{len(sizes)} extents for rank-{len(buffer_strides)} Buffer."
+                f"{len(raw_extents)} extents for rank-{len(buffer_strides)} Buffer."
             )
-        strides = buffer_strides[-len(sizes) :]
+        region_strides = buffer_strides[-len(raw_extents) :]
+        sizes, strides = self._squeeze_unit_dims(raw_extents, region_strides)
+
         offset = self._emit_linear_offset(buffer, indices, buffer_strides)
         dynamic = self._ir.ShapedType.get_dynamic_size()
         if isinstance(offset, int):
@@ -273,9 +329,20 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             static_offsets = [dynamic]
             layout_offset = dynamic
 
+        static_sizes: list[int] = []
+        size_operands: list[Any] = []
+        for size in sizes:
+            if isinstance(size, int):
+                static_sizes.append(size)
+            else:
+                static_sizes.append(dynamic)
+                size_operands.append(
+                    self._cast_to_index(self._get_or_create_expr_value(size))
+                )
+
         layout = self._ir.StridedLayoutAttr.get(layout_offset, strides)
         result_type = self._ir.MemRefType.get(
-            sizes,
+            static_sizes,
             self._dtype_type(buffer.dtype),
             layout=layout,
             memory_space=self._memory_scope(buffer),
@@ -284,14 +351,29 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             result_type,
             backing,
             dynamic_offsets,
-            [],
+            size_operands,
             [],
             static_offsets,
-            sizes,
+            static_sizes,
             strides,
         )
         self._insert_value(call, view_op.result)
         return view_op.result
+
+    @staticmethod
+    def _squeeze_unit_dims(
+        extents: list[Any],
+        strides: list[int],
+    ) -> tuple[list[Any], list[int]]:
+        sizes: list[Any] = []
+        kept_strides: list[int] = []
+        for extent, stride in zip(extents, strides):
+            static = TileLangIRTranslator._try_static_int(extent)
+            if static == 1:
+                continue
+            sizes.append(static if static is not None else extent)
+            kept_strides.append(stride)
+        return sizes, kept_strides
 
     def _emit_vadd(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
@@ -301,6 +383,21 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
 
+    def _emit_copy(self, call: tirx.Call) -> None:
+        if len(call.args) < 2:
+            raise ValueError(
+                f"tl.tileop.copy expects at least 2 arguments, but received {len(call.args)}"
+            )
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        ann = self._call_annotations(call)
+        CopyOp(
+            src,
+            dst,
+            split_dim=self._optional_int(ann.get("split_dim")),
+            transpose=True if self._as_bool(ann.get("transpose", False)) else None,
+        )
+
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
         if value.type == index_type:
@@ -308,6 +405,16 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if isinstance(value.type, self._ir.IntegerType):
             return self._arith.IndexCastOp(index_type, value).result
         raise TypeError(f"Cannot cast MLIR value of type {value.type} to index.")
+
+    def _unify_integer_operands(self, lhs: Any, rhs: Any) -> tuple[Any, Any]:
+        if lhs.type == rhs.type:
+            return lhs, rhs
+        index_type = self._ir.IndexType.get()
+        if lhs.type == index_type or rhs.type == index_type:
+            return self._cast_to_index(lhs), self._cast_to_index(rhs)
+        raise TypeError(
+            f"Cannot unify MLIR integer operand types {lhs.type} and {rhs.type}."
+        )
 
     def _memory_scope(self, buffer: Any) -> Any:
         scope = str(buffer.scope())
@@ -366,11 +473,20 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
     @staticmethod
     def _static_int(expr: Any, description: str) -> int:
-        if isinstance(expr, tirx.IntImm):
-            return int(expr.value)
+        value = TileLangIRTranslator._try_static_int(expr)
+        if value is not None:
+            return value
         raise NotImplementedError(
             f"Current TileLangIR storage lowering requires static {description}, but got {expr}."
         )
+
+    @staticmethod
+    def _try_static_int(expr: Any) -> int | None:
+        if isinstance(expr, tirx.IntImm):
+            return int(expr.value)
+        if isinstance(expr, int):
+            return expr
+        return None
 
     @staticmethod
     def _call_op_name(call: tirx.Call) -> str:
@@ -424,6 +540,16 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self.visit_stmt(op.block)
 
     def visit_sblock_(self, op: tirx.SBlock) -> None:
+        name = str(getattr(op, "name_hint", "") or "")
+        if name == "SimdVF":
+            scope_op = ScopeOp(simd_attr="simd")
+            body_block = self._ir.Block.create_at_start(scope_op.body)
+            with self._ir.InsertionPoint(body_block):
+                for buffer in op.alloc_buffers:
+                    self._emit_alloc_buffer(buffer)
+                self.visit_stmt(op.body)
+            return
+
         for buffer in op.alloc_buffers:
             self._emit_alloc_buffer(buffer)
         self.visit_stmt(op.body)
@@ -606,6 +732,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     ) -> Any:
         """Emit an arith binary op, selecting the integer or float variant by the TIRX dtype."""
         is_float = isinstance(self._dtype_type(dtype), self._ir.FloatType)
+        if not is_float:
+            lhs, rhs = self._unify_integer_operands(lhs, rhs)
         name = float_op if is_float else integer_op
         return getattr(self._arith, name)(lhs, rhs).result
 
@@ -638,3 +766,39 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_region(op)
         elif op_name == "tl.tileop.vadd":
             self._emit_vadd(op)
+        elif op_name == "tl.tileop.copy":
+            self._emit_copy(op)
+
+    @staticmethod
+    def _call_annotations(call: tirx.Call) -> dict[str, Any]:
+        ann = getattr(call, "annotations", None)
+        if ann is None:
+            attrs = getattr(call, "attrs", None)
+            if attrs is None:
+                return {}
+            try:
+                return dict(attrs)
+            except TypeError:
+                return {}
+        try:
+            return dict(ann)
+        except TypeError:
+            return {}
+
+    @staticmethod
+    def _as_bool(expr: Any, default: bool = False) -> bool:
+        if isinstance(expr, tirx.IntImm):
+            return bool(expr.value)
+        if isinstance(expr, bool):
+            return expr
+        return default
+
+    @staticmethod
+    def _optional_int(expr: Any) -> int | None:
+        if expr is None:
+            return None
+        if isinstance(expr, tirx.IntImm):
+            return int(expr.value)
+        if isinstance(expr, int):
+            return expr
+        return None
