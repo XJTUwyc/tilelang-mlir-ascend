@@ -123,9 +123,6 @@ class GemmOp(_ods_ir.OpView):
         *,
         transpose_a: _Optional[bool] = None,
         transpose_b: _Optional[bool] = None,
-        m: _Optional[int] = None,
-        n: _Optional[int] = None,
-        k: _Optional[int] = None,
         clear_accum: _Optional[bool] = None,
         loc: _Optional[_ods_ir.Location] = None,
         ip: _Optional[_ods_ir.InsertionPoint] = None,
@@ -136,18 +133,6 @@ class GemmOp(_ods_ir.OpView):
             attributes["transpose_a"] = _ods_ir.UnitAttr.get(_ods_context)
         if transpose_b:
             attributes["transpose_b"] = _ods_ir.UnitAttr.get(_ods_context)
-        if m is not None:
-            attributes["m"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), m
-            )
-        if n is not None:
-            attributes["n"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), n
-            )
-        if k is not None:
-            attributes["k"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), k
-            )
         if clear_accum:
             attributes["clear_accum"] = _ods_ir.UnitAttr.get(_ods_context)
         super().__init__(
@@ -197,51 +182,6 @@ class GemmOp(_ods_ir.OpView):
             self.operation.attributes["transpose_b"] = _ods_ir.UnitAttr.get()
         elif "transpose_b" in self.operation.attributes:
             del self.operation.attributes["transpose_b"]
-
-    @builtins.property
-    def m(self) -> _Optional[int]:
-        if "m" not in self.operation.attributes:
-            return None
-        return _ods_ir.IntegerAttr(self.operation.attributes["m"]).value
-
-    @m.setter
-    def m(self, value: _Optional[int]):
-        if value is not None:
-            self.operation.attributes["m"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), value
-            )
-        elif "m" in self.operation.attributes:
-            del self.operation.attributes["m"]
-
-    @builtins.property
-    def n(self) -> _Optional[int]:
-        if "n" not in self.operation.attributes:
-            return None
-        return _ods_ir.IntegerAttr(self.operation.attributes["n"]).value
-
-    @n.setter
-    def n(self, value: _Optional[int]):
-        if value is not None:
-            self.operation.attributes["n"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), value
-            )
-        elif "n" in self.operation.attributes:
-            del self.operation.attributes["n"]
-
-    @builtins.property
-    def k(self) -> _Optional[int]:
-        if "k" not in self.operation.attributes:
-            return None
-        return _ods_ir.IntegerAttr(self.operation.attributes["k"]).value
-
-    @k.setter
-    def k(self, value: _Optional[int]):
-        if value is not None:
-            self.operation.attributes["k"] = _ods_ir.IntegerAttr.get(
-                _ods_ir.IntegerType.get_signless(64), value
-            )
-        elif "k" in self.operation.attributes:
-            del self.operation.attributes["k"]
 
     @builtins.property
     def clear_accum(self) -> bool:

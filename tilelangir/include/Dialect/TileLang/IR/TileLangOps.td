@@ -45,20 +45,21 @@ def TileLang_CopyOp : TileLang_Op<"copy"> {
     OptionalAttr<UnitAttr>:$transpose
   );
 
-  // No results, no regions (parity with _tilelang_ops_gen.CopyOp._ODS_REGIONS).
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$src `,` $dest attr-dict `:` type($src) `to` type($dest)";
 }
 
 // ---------------------------------------------------------------------------
 // tilelang.gemm
-// Matches Python: GemmOp(a, b, c, *, transpose_a/b, m, n, k, clear_accum)
+// Matches Python: GemmOp(a, b, c, *, transpose_a/b, clear_accum)
 // Generic form: "tilelang.gemm"(%a, %b, %c) {attrs} : (memref, ...) -> ()
 // ---------------------------------------------------------------------------
 def TileLang_GemmOp : TileLang_Op<"gemm"> {
   let summary = "TileLang matrix multiplication on three memref operands";
   let description = [{
     `tilelang.gemm` takes A, B, and C memref operands. It has no regions.
-    Optional attributes retain frontend matrix dimensions and
-    transpose/accumulator semantics.
+    Optional attributes retain transpose and accumulator semantics.
   }];
 
   let arguments = (ins
@@ -67,11 +68,12 @@ def TileLang_GemmOp : TileLang_Op<"gemm"> {
     AnyMemRef:$c,
     OptionalAttr<UnitAttr>:$transpose_a,
     OptionalAttr<UnitAttr>:$transpose_b,
-    OptionalAttr<I64Attr>:$m,
-    OptionalAttr<I64Attr>:$n,
-    OptionalAttr<I64Attr>:$k,
     OptionalAttr<UnitAttr>:$clear_accum
   );
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$a `,` $b `,` $c attr-dict `:` type($a) `,` type($b) `to` type($c)";
 }
 
 // ---------------------------------------------------------------------------
@@ -90,12 +92,28 @@ def TileLang_ScopeOp : TileLang_Op<"scope"> {
   }];
 
   let arguments = (ins OptionalAttr<StrAttr>:$simd_attr);
-  let regions = (region AnyRegion:$body);
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$body attr-dict";
 }
 
-// Note: `tilelang.launch_thread` is intentionally absent. For the current
-// tile backend, only `blockIdx.x` is effective and is modeled as an i32
-// function argument plus a `BlockIdx` function attribute rather than a custom
-// operation.
+// ---------------------------------------------------------------------------
+// tilelang.scope_yield
+// Terminator for tilelang.scope regions.
+// ---------------------------------------------------------------------------
+def TileLang_ScopeYieldOp : TileLang_Op<"scope_yield", [
+    Terminator, HasParent<"ScopeOp">
+  ]> {
+  let summary = "Terminator for tilelang.scope";
+  let description = [{
+    `tilelang.scope_yield` terminates the body region of a `tilelang.scope`.
+  }];
+
+  let arguments = (ins);
+  let assemblyFormat = "attr-dict";
+}
+
 
 #endif // TILELANG_DIALECT_IR_TILELANGOPS_TD
