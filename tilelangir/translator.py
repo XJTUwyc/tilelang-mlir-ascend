@@ -29,6 +29,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._func: Any = None
         self._linalg: Any = None
         self._memref: Any = None
+        self._scf: Any = None
 
     def translate(self, source_module: IRModule) -> str:
         # 1. Check that the input is a tvm.IRModule
@@ -40,7 +41,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         # 2. Load and validate the MLIR Python bindings
         try:
             from mlir import ir
-            from mlir.dialects import arith, func, linalg, memref
+            from mlir.dialects import arith, func, linalg, memref, scf
         except ImportError as exc:
             raise ImportError(
                 "TileLangIR codegen requires LLVM's official MLIR Python bindings. "
@@ -53,6 +54,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._func = func
         self._linalg = linalg
         self._memref = memref
+        self._scf = scf
 
         with ir.Context() as context:
             try:
@@ -79,6 +81,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 self._func = None
                 self._linalg = None
                 self._memref = None
+                self._scf = None
 
         return source
 
@@ -421,7 +424,90 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self.visit_stmt(op.body)
 
     def visit_for_(self, op: tirx.For) -> None:
-        self.visit_stmt(op.body)
+        index_type = self._ir.IndexType.get()
+        lower = self._cast_to_index(self._get_or_create_expr_value(op.min))
+        extent = self._cast_to_index(self._get_or_create_expr_value(op.extent))
+        upper = self._arith.AddIOp(lower, extent).result
+        if op.step is not None:
+            step = self._cast_to_index(self._get_or_create_expr_value(op.step))
+        else:
+            step = self._arith.ConstantOp(
+                index_type, self._ir.IntegerAttr.get(index_type, 1)
+            ).result
+
+        for_op = self._scf.ForOp(lower, upper, step)
+        loop_kind = self._loop_kind_attr(op)
+        if loop_kind is not None:
+            for_op.attributes["tilelang.loop_kind"] = loop_kind
+        self._copy_loop_annotations(op, for_op)
+
+        # Scope the value_map to this region. TIRX may alias the same node (e.g.
+        # an interned IntImm loop bound) at several tree positions. Values created
+        # inside the scf.for body must not be reused outside it, otherwise an
+        # arith.index_cast emitted in a parent region could reference an operand
+        # defined in this (child) region, violating SSA dominance.
+        body_keys = set(self.value_map)
+        self._insert_value(op.loop_var, for_op.induction_variable)
+        with self._ir.InsertionPoint(for_op.body):
+            self.visit_stmt(op.body)
+            self._scf.YieldOp([])
+        for key in list(self.value_map):
+            if key not in body_keys:
+                del self.value_map[key]
+
+    def _loop_kind_attr(self, op: tirx.For) -> Any:
+        """Classify a TIRX For into a ``tilelang.loop_kind`` string attribute.
+
+        Pipelined loops are represented in TIRX as Serial loops carrying
+        ``num_stages``/``tl_pipeline_*`` annotations (see README.md).
+        """
+        kind = op.kind
+        if kind == tirx.ForKind.SERIAL:
+            if op.annotations and "num_stages" in op.annotations:
+                return self._ir.StringAttr.get("pipelined")
+            return self._ir.StringAttr.get("serial")
+        if kind == tirx.ForKind.PARALLEL:
+            return self._ir.StringAttr.get("parallel")
+        if kind == tirx.ForKind.VECTORIZED:
+            return self._ir.StringAttr.get("vectorized")
+        if kind == tirx.ForKind.UNROLLED:
+            return self._ir.StringAttr.get("unrolled")
+        # THREAD_BINDING is handled by tilelang.launch_thread, not scf.for.
+        return None
+
+    _PIPELINE_ANNOTATION_KEYS = (
+        "num_stages",
+        "tl_pipeline_order",
+        "tl_pipeline_stage",
+        "tl_pipeline_group",
+    )
+
+    def _copy_loop_annotations(self, op: tirx.For, for_op: Any) -> None:
+        """Mirror pipeline and loop annotations onto the scf.for operation."""
+        if not op.annotations:
+            return
+        for key in self._PIPELINE_ANNOTATION_KEYS:
+            if key not in op.annotations:
+                continue
+            try:
+                for_op.attributes[key] = self._annotation_value_to_attr(op.annotations[key])
+            except NotImplementedError:
+                continue
+
+    def _annotation_value_to_attr(self, value: Any) -> Any:
+        if isinstance(value, tirx.IntImm):
+            return self._ir.IntegerAttr.get(
+                self._ir.IntegerType.get_signless(64), int(value.value)
+            )
+        if isinstance(value, tirx.FloatImm):
+            return self._ir.FloatAttr.get(self._ir.F64Type.get(), float(value.value))
+        # tirx.Array and Python list/tuple both iterate element-wise.
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+            elements = [self._annotation_value_to_attr(v) for v in value]
+            return self._ir.ArrayAttr.get(elements)
+        raise NotImplementedError(
+            f"TileLangIR loop annotation lowering does not support {type(value).__name__}: {value}"
+        )
 
     def visit_attr_stmt_(self, op: tirx.AttrStmt) -> None:
         self.visit_stmt(op.body)
@@ -446,20 +532,93 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         ).result
         self._insert_value(op, value)
 
+    def visit_buffer_load_(self, op: tirx.BufferLoad) -> None:
+        """
+        Lower TIRX BufferLoad:
+
+            buffer[i, j]
+
+        into:
+
+            memref.load %buffer[%i, %j]
+        """
+
+        buffer = op.buffer
+
+        memref_value = self._get_value(buffer)
+
+        indices = [
+            self._cast_to_index(
+                self._get_or_create_expr_value(index)
+            )
+            for index in op.indices
+        ]
+
+        loaded = self._memref.LoadOp(
+            memref_value,
+            indices,
+        ).result
+
+        self._insert_value(op, loaded)
+
+
+    def visit_buffer_store_(self, op: tirx.BufferStore) -> None:
+        """
+        Lower TIRX BufferStore:
+
+            buffer[i, j] = value
+
+        into:
+
+            memref.store value, buffer[%i, %j]
+        """
+
+        buffer = op.buffer
+
+        memref_value = self._get_value(buffer)
+
+        value = self._get_or_create_expr_value(op.value)
+
+        indices = [
+            self._cast_to_index(
+                self._get_or_create_expr_value(index)
+            )
+            for index in op.indices
+        ]
+
+        self._memref.StoreOp(
+            value,
+            memref_value,
+            indices,
+        )
+
+    def _arith_binary_op(
+        self, dtype: Any, lhs: Any, rhs: Any, integer_op: str, float_op: str
+    ) -> Any:
+        """Emit an arith binary op, selecting the integer or float variant by the TIRX dtype."""
+        is_float = isinstance(self._dtype_type(dtype), self._ir.FloatType)
+        name = float_op if is_float else integer_op
+        return getattr(self._arith, name)(lhs, rhs).result
+
     def visit_add_(self, op: tirx.Add) -> None:
         lhs = self._get_or_create_expr_value(op.a)
         rhs = self._get_or_create_expr_value(op.b)
-        self._insert_value(op, self._arith.AddIOp(lhs, rhs).result)
+        self._insert_value(op, self._arith_binary_op(op.dtype, lhs, rhs, "AddIOp", "AddFOp"))
 
     def visit_sub_(self, op: tirx.Sub) -> None:
         lhs = self._get_or_create_expr_value(op.a)
         rhs = self._get_or_create_expr_value(op.b)
-        self._insert_value(op, self._arith.SubIOp(lhs, rhs).result)
+        self._insert_value(op, self._arith_binary_op(op.dtype, lhs, rhs, "SubIOp", "SubFOp"))
 
     def visit_mul_(self, op: tirx.Mul) -> None:
         lhs = self._get_or_create_expr_value(op.a)
         rhs = self._get_or_create_expr_value(op.b)
-        self._insert_value(op, self._arith.MulIOp(lhs, rhs).result)
+        self._insert_value(op, self._arith_binary_op(op.dtype, lhs, rhs, "MulIOp", "MulFOp"))
+
+    def visit_div_(self, op: tirx.Div) -> None:
+        lhs = self._get_or_create_expr_value(op.a)
+        rhs = self._get_or_create_expr_value(op.b)
+        self._insert_value(op, self._arith_binary_op(op.dtype, lhs, rhs, "DivSIOp", "DivFOp"))
 
     # Add all handlers for native TIRX expressions here.
 
