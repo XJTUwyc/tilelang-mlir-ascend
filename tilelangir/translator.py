@@ -23,7 +23,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
     def __init__(self) -> None:
         super().__init__()
-        self.value_map: dict[object, Any] = {} # value_map stores mappings from TIRX objects to MLIR Values, ensuring that the same TIRX object maps to the same MLIR Value
+        self.value_map: dict[int, Any] = {} # value_map stores mappings from TIRX object identities to MLIR Values, ensuring that the same TIRX object maps to the same MLIR Value
         self._arith: Any = None
         self._ir: Any = None
         self._func: Any = None
@@ -381,28 +381,26 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     #############
     # Insert a mapping from a TIRX object into value_map
     def _insert_value(self, tirx_object: object, mlir_value: Any) -> None:
-        if tirx_object in self.value_map:
-            if self.value_map[tirx_object] == mlir_value:
+        key = tirx_object.id_
+        if key in self.value_map:
+            if self.value_map[key] == mlir_value:
                 return
             raise ValueError(f"TIRX value is already present in value_map: {tirx_object}")
-        self.value_map[tirx_object] = mlir_value
+        self.value_map[key] = mlir_value
 
     # Get the MLIR Value mapped to a TIRX object
     def _get_value(self, tirx_object: object) -> Any:
+        key = tirx_object.id_
         try:
-            return self.value_map[tirx_object]
+            return self.value_map[key]
         except KeyError as exc:
             raise KeyError(f"TIRX value has not been lowered yet: {tirx_object}") from exc
 
     def _get_or_create_expr_value(self, expr: tirx.PrimExpr) -> Any:
         """Get or emit the MLIR Value represented by a TIRX PrimExpr."""
 
-        if isinstance(expr, tirx.IntImm):
-            return self._emit_int_imm_value(expr)
-        if isinstance(expr, tirx.FloatImm):
-            return self._emit_float_imm_value(expr)
-
-        if expr in self.value_map:
+        key = expr.id_
+        if key in self.value_map:
             return self._get_value(expr)
 
         self.visit_expr(expr)
@@ -519,27 +517,27 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
     # The following methods are dispatched by visit_expr.
     def visit_var_(self, op: tirx.Var) -> None:
-        raise KeyError(f"TIRX Var has not been bound to an MLIR Value: {op.name}")
+        self._get_value(op)
 
-    def _emit_int_imm_value(self, op: tirx.IntImm) -> Any:
+    def visit_int_imm_(self, op: tirx.IntImm) -> None:
+        if op.id_ in self.value_map:
+            return
         result_type = self._dtype_type(op.dtype)
-        return self._arith.ConstantOp(
+        value = self._arith.ConstantOp(
             result_type,
             self._ir.IntegerAttr.get(result_type, int(op.value)),
         ).result
+        self._insert_value(op, value)
 
-    def _emit_float_imm_value(self, op: tirx.FloatImm) -> Any:
+    def visit_float_imm_(self, op: tirx.FloatImm) -> None:
+        if op.id_ in self.value_map:
+            return
         result_type = self._dtype_type(op.dtype)
-        return self._arith.ConstantOp(
+        value = self._arith.ConstantOp(
             result_type,
             self._ir.FloatAttr.get(result_type, float(op.value)),
         ).result
-
-    def visit_int_imm_(self, op: tirx.IntImm) -> None:
-        self._emit_int_imm_value(op)
-
-    def visit_float_imm_(self, op: tirx.FloatImm) -> None:
-        self._emit_float_imm_value(op)
+        self._insert_value(op, value)
 
     def visit_buffer_load_(self, op: tirx.BufferLoad) -> None:
         """
