@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 from tvm import IRModule, tirx
@@ -554,6 +556,60 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"{type(expr).__name__}: {expr}"
             ) from exc
 
+    @contextmanager
+    def _scoped_value_map(self) -> Generator[None, None, None]:
+        """Lexically scope the value_map to the enclosing ``with`` block.
+
+        Values created inside a child region (e.g. a ``tilelang.scope`` or
+        ``scf.for`` body) must not be referenced by the enclosing block,
+        otherwise an SSA value defined in the child region could be used where
+        it does not dominate the use site. Save the current key set on entry
+        and drop every newly-added key on exit, even if an exception
+        propagates.
+        """
+        saved_keys = set(self.value_map)
+        try:
+            yield
+        finally:
+            for key in list(self.value_map):
+                if key not in saved_keys:
+                    del self.value_map[key]
+
+
+    @staticmethod
+    def _int_value(expr) -> int | None:
+        """Return the int value if *expr* is a constant, else None."""
+        if isinstance(expr, tirx.IntImm):
+            return int(expr)
+        return None
+
+    def _serialize_regions(self, regions) -> Any:
+        """Serialize a list of TIR BufferRegion as a ``buf[range, ...], ...`` StringAttr.
+
+        Constant bounds are emitted as plain integers. Symbolic bounds (loop
+        or free variables, or arithmetic over them) are emitted as their
+        printed form so that serialization never calls ``int()`` on a
+        non-constant expression (which would raise ``TypeError``).
+        """
+        parts = []
+        for region in regions:
+            buf = region.buffer
+            buf_name = getattr(buf, "name_hint", None) or buf.name
+            range_strs = []
+            for r in region.region:
+                lo = self._int_value(r.min)
+                ext = self._int_value(r.extent) if r.extent is not None else 1
+                if lo is not None and ext is not None:
+                    range_strs.append(f"{lo}:{lo + ext}")
+                else:
+                    lo_s = str(lo) if lo is not None else str(r.min)
+                    ext_s = str(ext) if ext is not None else str(r.extent)
+                    range_strs.append(f"{lo_s}:{lo_s}+{ext_s}")
+            parts.append(f"{buf_name}[{', '.join(range_strs)}]")
+        combined = ", ".join(parts)
+        return self._ir.StringAttr.get(combined)
+
+
     #############
     # Overridden visitor methods
     #############
@@ -565,17 +621,32 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     def visit_sblock_(self, op: tirx.SBlock) -> None:
         name = str(getattr(op, "name_hint", "") or "")
         if name == "SimdVF":
-            scope_op = ScopeOp(simd_attr="simd")
-            body_block = self._ir.Block.create_at_start(scope_op.body)
-            with self._ir.InsertionPoint(body_block):
-                for buffer in op.alloc_buffers:
-                    self._emit_alloc_buffer(buffer)
-                self.visit_stmt(op.body)
+            self._emit_simdvf_scope(op)
             return
 
         for buffer in op.alloc_buffers:
             self._emit_alloc_buffer(buffer)
         self.visit_stmt(op.body)
+
+    def _emit_simdvf_scope(self, op: tirx.SBlock) -> None:
+        """Emit a ``tilelang.scope`` region for a ``T.SimdVF()`` SBlock.
+
+        The SBlock's alloc_buffers and body live in the scope's nested region.
+        Values created inside are scoped to that region and dropped from the
+        value_map afterwards, mirroring visit_for_: an SSA value defined in a
+        child region must not be referenced by the enclosing block.
+        """
+        scope_op = ScopeOp(simd_attr="simd")
+        if op.reads:
+            scope_op.attributes["reads"] = self._serialize_regions(op.reads)
+        if op.writes:
+            scope_op.attributes["writes"] = self._serialize_regions(op.writes)
+
+        body_block = self._ir.Block.create_at_start(scope_op.body)
+        with self._ir.InsertionPoint(body_block), self._scoped_value_map():
+            for buffer in op.alloc_buffers:
+                self._emit_alloc_buffer(buffer)
+            self.visit_stmt(op.body)
 
     def visit_for_(self, op: tirx.For) -> None:
         index_type = self._ir.IndexType.get()
