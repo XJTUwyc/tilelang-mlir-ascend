@@ -462,6 +462,116 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             transpose_b=transpose_b,
             clear_accum=clear_accum,
         )
+    def _emit_vcvt(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(f"tl.tileop.vcvt expects 3 arguments, but received {len(call.args)}")
+        dtype_arg = call.args[2]
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        src_type = src.type
+        dst_type = dst.type
+
+        src_element = src_type.element_type
+        dst_element = dst_type.element_type
+        rank = dst_type.rank
+
+        indexing_map = self._ir.AffineMap.get(
+            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
+        )
+        indexing_maps = self._ir.ArrayAttr.get(
+            [self._ir.AffineMapAttr.get(indexing_map)] * 2
+        )
+        iterator_types = self._ir.ArrayAttr.get(
+            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+        )
+        generic = self._linalg.GenericOp(
+            result_tensors=[],
+            inputs=[src],
+            outputs=[dst],
+            indexing_maps=indexing_maps,
+            iterator_types=iterator_types,
+        )
+        block = generic.regions[0].blocks.append(src_element, dst_element)
+        with self._ir.InsertionPoint(block):
+            src_dtype_name = self._region_dtype_name(call.args[0])
+            result = self._build_arith_cast(
+                block.arguments[0], dst_element, dtype_arg.value, src_dtype_name
+            )
+            self._linalg.YieldOp([result])
+
+    @staticmethod
+    def _region_dtype_name(region_call: Any) -> str | None:
+        try:
+            if not isinstance(region_call, tirx.Call):
+                return None
+            buffer_load = region_call.args[0]
+            if not isinstance(buffer_load, tirx.BufferLoad):
+                return None
+            return str(buffer_load.buffer.dtype)
+        except (AttributeError, IndexError):
+            return None
+
+    def _build_arith_cast(
+        self,
+        value: Any,
+        dst_type: Any,
+        dst_dtype_name: str,
+        src_dtype_name: str | None = None,
+    ) -> Any:
+        src_type = value.type
+        if src_type == dst_type:
+            return value
+
+        dst_is_unsigned = dst_dtype_name.startswith("uint")
+        src_is_unsigned = src_dtype_name is not None and src_dtype_name.startswith("uint")
+
+        if isinstance(src_type, self._ir.FloatType):
+            if isinstance(dst_type, self._ir.FloatType):
+                # float -> float: narrow / widen / reinterpret by bit-width.
+                src_width = int(src_type.width)
+                dst_width = int(dst_type.width)
+                if src_width > dst_width:
+                    return self._arith.TruncFOp(dst_type, value).result
+                elif src_width < dst_width:
+                    return self._arith.ExtFOp(dst_type, value).result
+                else:
+                    # Same bit-width but different float types (e.g. bf16 <-> f16):
+                    # arith has no direct cast, so round-trip through a wider type.
+                    wider = (
+                        self._ir.F64Type.get()
+                        if src_width >= 32
+                        else self._ir.F32Type.get()
+                    )
+                    extended = self._arith.ExtFOp(wider, value).result
+                    return self._arith.TruncFOp(dst_type, extended).result
+            else:
+                # float -> int: signed/unsigned decided by destination dtype name.
+                if dst_is_unsigned:
+                    return self._arith.FPToUIOp(dst_type, value).result
+                else:
+                    return self._arith.FPToSIOp(dst_type, value).result
+        else:
+            if isinstance(dst_type, self._ir.FloatType):
+                # int -> float: signed/unsigned decided by source dtype name.
+                if src_is_unsigned:
+                    return self._arith.UIToFPOp(dst_type, value).result
+                else:
+                    return self._arith.SIToFPOp(dst_type, value).result
+            else:
+                # int -> int: narrow / extend / reinterpret by bit-width.
+                src_width = int(src_type.width)
+                dst_width = int(dst_type.width)
+                if src_width > dst_width:
+                    return self._arith.TruncIOp(dst_type, value).result
+                elif src_width < dst_width:
+                    if src_is_unsigned:
+                        return self._arith.ExtUIOp(dst_type, value).result
+                    else:
+                        return self._arith.ExtSIOp(dst_type, value).result
+                else:
+                    raise AssertionError(
+                        f"unreachable int->int same-width cast: {src_type} -> {dst_type}"
+                    )
 
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
@@ -871,7 +981,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_fill(op)
         elif op_name == "tl.infinity":
             self._emit_infinity(op)
-
+        elif op_name == "tl.tileop.vcvt":
+            self._emit_vcvt(op)
 
     def _emit_fill(self, op: tirx.Call) -> None:
         if len(op.args) != 2:
@@ -883,7 +994,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         buffer = self._get_or_create_expr_value(op.args[0])
         value = self._get_or_create_expr_value(op.args[1])
         self._linalg.fill(value, outs=[buffer])
-
 
     def _emit_infinity(self, op: tirx.Call) -> None:
         if len(op.args) != 1:
@@ -931,3 +1041,4 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if isinstance(expr, int):
             return expr
         return None
+
