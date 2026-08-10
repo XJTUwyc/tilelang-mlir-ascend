@@ -423,6 +423,38 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             clear_accum=clear_accum,
         )
 
+    def _emit_vmuls(self, call: tirx.Call) -> None:
+        if len(call.args) < 3:
+            raise ValueError(
+                f"tl.tileop.vmuls expects at least 3 arguments, but received {len(call.args)}"
+            )
+        src = self._get_or_create_expr_value(call.args[0])
+        scalar = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+
+        element_type = src.type.element_type
+        identity = self._ir.AffineMap.get_identity(1)
+        indexing_maps = self._ir.ArrayAttr.get([
+            self._ir.AffineMapAttr.get(identity),
+            self._ir.AffineMapAttr.get(identity),
+        ])
+        iterator_types = [self._ir.StringAttr.get("parallel")]
+        generic = self._linalg.GenericOp(
+            [],
+            [src],
+            [dst],
+            indexing_maps,
+            iterator_types
+        )
+        body_region = generic.regions[0]
+        block = self._ir.Block.create_at_start(
+            body_region,
+            [element_type, element_type]
+        )
+        with self._arith.InsertionPoint(block):
+            mul = self._arith.MulFOp(block.arguments[0], scalar)
+            self._linalg.YieldOp([mul.result])
+
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
         if value.type == index_type:
@@ -793,6 +825,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.vmuls":
+            self._emit_vmuls(op)
 
     @staticmethod
     def _call_annotations(call: tirx.Call) -> dict[str, Any]:
