@@ -793,6 +793,35 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.fill":
+            self._emit_fill(op)
+        elif op_name == "tl.infinity":
+            self._emit_infinity(op)
+
+
+    def _emit_fill(self, op: tirx.Call) -> None:
+        if len(op.args) != 2:
+            raise ValueError(f"tl.tileop.fill expects 2 arguments, but received {len(op.args)}")
+
+        # arg0 是 tl.tileop.region Call 节点，尚未 lower，必须用 _get_or_create_expr_value
+        # 先触发 _emit_region 生成 memref view，再取其 Value（与 _emit_vadd 一致）。
+        # arg1 是 fill 的值。
+        buffer = self._get_or_create_expr_value(op.args[0])
+        value = self._get_or_create_expr_value(op.args[1])
+        self._linalg.fill(value, outs=[buffer])
+
+
+    def _emit_infinity(self, op: tirx.Call) -> None:
+        if len(op.args) != 1:
+            raise ValueError(f"tl.infinity expects 1 argument, but received {len(op.args)}")
+
+        # op.args[0] 是 StringImm（如 "float16"），它自身的 .dtype 是 "handle"，
+        # 不能用作元素类型。真正的元素 dtype 来自 call 的返回 dtype（op.dtype）。
+        # 这与 visit_float_imm_ 用 op.dtype 的写法一致。
+        result_type = self._dtype_type(op.dtype)
+        inf_attr = self._ir.FloatAttr.get(result_type, float("inf"))
+        value = self._arith.ConstantOp(result_type, inf_attr).result
+        self._insert_value(op, value)
 
     @staticmethod
     def _call_annotations(call: tirx.Call) -> dict[str, Any]:
