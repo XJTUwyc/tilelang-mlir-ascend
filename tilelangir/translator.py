@@ -28,6 +28,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._ir: Any = None
         self._func: Any = None
         self._linalg: Any = None
+        self._math: Any = None
         self._memref: Any = None
         self._scf: Any = None
 
@@ -41,7 +42,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         # 2. Load and validate the MLIR Python bindings
         try:
             from mlir import ir
-            from mlir.dialects import arith, func, linalg, memref, scf
+            from mlir.dialects import arith, func, linalg, math, memref, scf
         except ImportError as exc:
             raise ImportError(
                 "TileLangIR codegen requires LLVM's official MLIR Python bindings. "
@@ -53,6 +54,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._ir = ir
         self._func = func
         self._linalg = linalg
+        self._math = math
         self._memref = memref
         self._scf = scf
 
@@ -80,6 +82,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 self._ir = None
                 self._func = None
                 self._linalg = None
+                self._math = None
                 self._memref = None
                 self._scf = None
 
@@ -382,6 +385,41 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
+
+    def _emit_vexpdif(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(
+                f"tl.tileop.vexpdif expects 3 arguments, but received {len(call.args)}"
+            )
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+
+        dst_type = dst.type
+        rank = dst_type.rank
+        element_type = dst_type.element_type
+
+        indexing_map = self._ir.AffineMap.get(
+            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
+        )
+        indexing_maps = self._ir.ArrayAttr.get(
+            [self._ir.AffineMapAttr.get(indexing_map)] * 3
+        )
+        iterator_types = self._ir.ArrayAttr.get(
+            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+        )
+        generic = self._linalg.GenericOp(
+            result_tensors=[],
+            inputs=[src0, src1],
+            outputs=[dst],
+            indexing_maps=indexing_maps,
+            iterator_types=iterator_types,
+        )
+        block = generic.regions[0].blocks.append(element_type, element_type, element_type)
+        with self._ir.InsertionPoint(block):
+            diff = self._arith.SubFOp(block.arguments[0], block.arguments[1]).result
+            result = self._math.ExpOp(diff).result
+            self._linalg.YieldOp([result])
 
     def _emit_copy(self, call: tirx.Call) -> None:
         if len(call.args) < 2:
@@ -789,6 +827,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_region(op)
         elif op_name == "tl.tileop.vadd":
             self._emit_vadd(op)
+        elif op_name == "tl.tileop.vexpdif":
+            self._emit_vexpdif(op)
         elif op_name == "tl.tileop.copy":
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
