@@ -40,7 +40,6 @@ def test_fill_infinity_emits_linalg_fill_and_arith_constant():
 
     assert "linalg.fill" in mlir, "_emit_fill did not emit linalg.fill"
     assert "arith.constant" in mlir, "_emit_infinity did not emit arith.constant"
-    # f32 +inf: 0x7F800000 (位模式) or inf (符号形式)
     assert "0x7F800000" in mlir or "inf" in mlir, "FloatAttr is not +inf"
     assert "0xFF800000" not in mlir, "FloatAttr is -inf, expected +inf"
 
