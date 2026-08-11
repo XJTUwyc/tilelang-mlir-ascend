@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 from tvm import IRModule, tirx
@@ -592,6 +594,28 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"{type(expr).__name__}: {expr}"
             ) from exc
 
+    @contextmanager
+    def _scoped_value_map(self) -> Generator[None, None, None]:
+        """Lexically scope the value_map to the enclosing ``with`` block.
+
+        Values created inside a child region (e.g. a ``tilelang.scope`` or
+        ``scf.for`` body) must not be referenced by the enclosing block,
+        otherwise an SSA value defined in the child region could be used where
+        it does not dominate the use site. Save the current key set on entry
+        and drop every newly-added key on exit, even if an exception
+        propagates.
+        """
+        saved_keys = set(self.value_map)
+        try:
+            yield
+        finally:
+            for key in list(self.value_map):
+                if key not in saved_keys:
+                    del self.value_map[key]
+
+
+
+
     #############
     # Overridden visitor methods
     #############
@@ -603,17 +627,27 @@ class TileLangIRTranslator(PyStmtExprVisitor):
     def visit_sblock_(self, op: tirx.SBlock) -> None:
         name = str(getattr(op, "name_hint", "") or "")
         if name == "SimdVF":
-            scope_op = ScopeOp(simd_attr="simd")
-            body_block = self._ir.Block.create_at_start(scope_op.body)
-            with self._ir.InsertionPoint(body_block):
-                for buffer in op.alloc_buffers:
-                    self._emit_alloc_buffer(buffer)
-                self.visit_stmt(op.body)
+            self._emit_simdvf_scope(op)
             return
 
         for buffer in op.alloc_buffers:
             self._emit_alloc_buffer(buffer)
         self.visit_stmt(op.body)
+
+    def _emit_simdvf_scope(self, op: tirx.SBlock) -> None:
+        """Emit a ``tilelang.scope`` region for a ``T.SimdVF()`` SBlock.
+
+        The SBlock's alloc_buffers and body live in the scope's nested region.
+        Values created inside are scoped to that region and dropped from the
+        value_map afterwards, mirroring visit_for_: an SSA value defined in a
+        child region must not be referenced by the enclosing block.
+        """
+        scope_op = ScopeOp(simd_attr="simd")
+        body_block = self._ir.Block.create_at_start(scope_op.body)
+        with self._ir.InsertionPoint(body_block), self._scoped_value_map():
+            for buffer in op.alloc_buffers:
+                self._emit_alloc_buffer(buffer)
+            self.visit_stmt(op.body)
 
     def visit_for_(self, op: tirx.For) -> None:
         index_type = self._ir.IndexType.get()
