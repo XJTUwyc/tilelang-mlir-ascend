@@ -576,38 +576,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                     del self.value_map[key]
 
 
-    @staticmethod
-    def _int_value(expr) -> int | None:
-        """Return the int value if *expr* is a constant, else None."""
-        if isinstance(expr, tirx.IntImm):
-            return int(expr)
-        return None
-
-    def _serialize_regions(self, regions) -> Any:
-        """Serialize a list of TIR BufferRegion as a ``buf[range, ...], ...`` StringAttr.
-
-        Constant bounds are emitted as plain integers. Symbolic bounds (loop
-        or free variables, or arithmetic over them) are emitted as their
-        printed form so that serialization never calls ``int()`` on a
-        non-constant expression (which would raise ``TypeError``).
-        """
-        parts = []
-        for region in regions:
-            buf = region.buffer
-            buf_name = getattr(buf, "name_hint", None) or buf.name
-            range_strs = []
-            for r in region.region:
-                lo = self._int_value(r.min)
-                ext = self._int_value(r.extent) if r.extent is not None else 1
-                if lo is not None and ext is not None:
-                    range_strs.append(f"{lo}:{lo + ext}")
-                else:
-                    lo_s = str(lo) if lo is not None else str(r.min)
-                    ext_s = str(ext) if ext is not None else str(r.extent)
-                    range_strs.append(f"{lo_s}:{lo_s}+{ext_s}")
-            parts.append(f"{buf_name}[{', '.join(range_strs)}]")
-        combined = ", ".join(parts)
-        return self._ir.StringAttr.get(combined)
 
 
     #############
@@ -637,11 +605,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         child region must not be referenced by the enclosing block.
         """
         scope_op = ScopeOp(simd_attr="simd")
-        if op.reads:
-            scope_op.attributes["reads"] = self._serialize_regions(op.reads)
-        if op.writes:
-            scope_op.attributes["writes"] = self._serialize_regions(op.writes)
-
         body_block = self._ir.Block.create_at_start(scope_op.body)
         with self._ir.InsertionPoint(body_block), self._scoped_value_map():
             for buffer in op.alloc_buffers:
