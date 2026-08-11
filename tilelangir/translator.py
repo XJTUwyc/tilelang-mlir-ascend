@@ -383,6 +383,130 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
 
+    def _emit_vmul(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(f"tl.tileop.vmul expects 3 arguments, but received {len(call.args)}")
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+        self._linalg.mul(src0, src1, outs=[dst])
+
+    def _emit_vreduce_max(self, call: tirx.Call) -> None:
+        if len(call.args) != 2:
+            raise ValueError(f"tl.tileop.vreduce_max expects 2 arguments, but received {len(call.args)}")
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        self._emit_linalg_reduce(src, dst, "maxf")
+
+    def _emit_vreduce_sum(self, call: tirx.Call) -> None:
+        if len(call.args) != 2:
+            raise ValueError(f"tl.tileop.vreduce_sum expects 2 arguments, but received {len(call.args)}")
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        self._emit_linalg_reduce(src, dst, "addf")
+
+    def _emit_linalg_reduce(self, src: Any, dst: Any, kind: str) -> None:
+        src_type = self._ir.MemRefType(src.type)
+        dst_type = self._ir.MemRefType(dst.type)
+        element_type = src_type.element_type
+
+        dim = src_type.rank - 1
+        result_shape = list(src_type.shape)
+        del result_shape[dim]
+
+        src_tensor_type = self._ir.RankedTensorType.get(src_type.shape, element_type)
+        src_tensor = self._ir.Operation.create(
+            "bufferization.to_tensor",
+            results=[src_tensor_type],
+            operands=[src],
+        ).result
+
+        if kind == "maxf":
+            identity_val = float("-inf")
+        else:
+            identity_val = 0.0
+        identity_attr = self._ir.FloatAttr.get(element_type, identity_val)
+
+        if len(result_shape) == 0:
+            init_type = self._ir.RankedTensorType.get([], element_type)
+            gen_op = self._ir.Operation.create(
+                "tensor.generate", results=[init_type], operands=[], regions=1,
+            )
+            gen_body = gen_op.regions[0].blocks.append()
+            with self._ir.InsertionPoint(gen_body):
+                cst = self._arith.ConstantOp(element_type, identity_attr).result
+                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
+            init_tensor = gen_op.result
+
+            reduce_op = self._ir.Operation.create(
+                "linalg.reduce",
+                results=[init_type],
+                operands=[src_tensor, init_tensor],
+                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
+                regions=1,
+            )
+            body = reduce_op.regions[0].blocks.append(element_type, element_type)
+            with self._ir.InsertionPoint(body):
+                if kind == "maxf":
+                    val = self._arith.MaximumFOp(body.arguments[0], body.arguments[1]).result
+                else:
+                    val = self._arith.AddFOp(body.arguments[0], body.arguments[1]).result
+                self._ir.Operation.create("linalg.yield", results=[], operands=[val])
+
+            dst_tensor_type = self._ir.RankedTensorType.get(dst_type.shape, element_type)
+            dst_empty = self._ir.Operation.create(
+                "tensor.empty", results=[dst_tensor_type]
+            ).result
+            insert_op = self._ir.Operation.create(
+                "tensor.insert_slice",
+                results=[dst_tensor_type],
+                operands=[reduce_op.result, dst_empty],
+                attributes={
+                    "static_offsets": self._ir.DenseI64ArrayAttr.get([]),
+                    "static_sizes": self._ir.DenseI64ArrayAttr.get([]),
+                    "static_strides": self._ir.DenseI64ArrayAttr.get([]),
+                    "operandSegmentSizes": self._ir.DenseI32ArrayAttr.get([1, 1, 0, 0, 0]),
+                },
+            )
+            self._ir.Operation.create(
+                "bufferization.materialize_in_destination",
+                results=[],
+                operands=[insert_op.result, dst],
+                attributes={"writable": self._ir.UnitAttr.get()},
+            )
+        else:
+            init_type = self._ir.RankedTensorType.get(result_shape, element_type)
+            gen_op = self._ir.Operation.create(
+                "tensor.generate", results=[init_type], operands=[], regions=1,
+            )
+            gen_body = gen_op.regions[0].blocks.append()
+            with self._ir.InsertionPoint(gen_body):
+                cst = self._arith.ConstantOp(element_type, identity_attr).result
+                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
+            init_tensor = gen_op.result
+
+            reduce_op = self._ir.Operation.create(
+                "linalg.reduce",
+                results=[init_type],
+                operands=[src_tensor, init_tensor],
+                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
+                regions=1,
+            )
+            body = reduce_op.regions[0].blocks.append(element_type, element_type)
+            with self._ir.InsertionPoint(body):
+                if kind == "maxf":
+                    val = self._arith.MaximumFOp(body.arguments[0], body.arguments[1]).result
+                else:
+                    val = self._arith.AddFOp(body.arguments[0], body.arguments[1]).result
+                self._ir.Operation.create("linalg.yield", results=[], operands=[val])
+
+            self._ir.Operation.create(
+                "bufferization.materialize_in_destination",
+                results=[],
+                operands=[reduce_op.result, dst],
+                attributes={"writable": self._ir.UnitAttr.get()},
+            )
+
     def _emit_copy(self, call: tirx.Call) -> None:
         if len(call.args) < 2:
             raise ValueError(
@@ -789,6 +913,12 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_region(op)
         elif op_name == "tl.tileop.vadd":
             self._emit_vadd(op)
+        elif op_name == "tl.tileop.vmul":
+            self._emit_vmul(op)
+        elif op_name == "tl.tileop.vreduce_max":
+            self._emit_vreduce_max(op)
+        elif op_name == "tl.tileop.vreduce_sum":
+            self._emit_vreduce_sum(op)
         elif op_name == "tl.tileop.copy":
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
