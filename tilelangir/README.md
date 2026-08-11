@@ -27,7 +27,8 @@
 | 条件语句 | `scf.if` | 保留 then/else Region。 |
 | `SBlock` | `scf.execute_region` | 在 Operation 上增加 `tilelang.sblock_name` 等普通 Attribute；不转换自动推导的 `reads`/`writes`。 |
 | `SimdVF` | `scf.execute_region` | 增加表示 SimdVF scope 的普通 Attribute。 |
-| `vmuls`、`vadd`、`vmul`、`vmax` | `linalg` 结构化逐元素操作 | 标量计算体使用 `arith` Operation；不在 Codegen 中融合这些操作。 |
+| `vmuls` | `linalg` 结构化逐元素操作 | 向量与标量逐元素相乘；标量计算体根据其dtype使用 `arith` 的 `MulFOp`/`MulIOp` |
+| `vadd`、`vmul`、`vmax` | `linalg` 结构化逐元素操作 | 标量计算体使用 `arith` Operation；不在 Codegen 中融合这些操作。 |
 | `vreduce_sum`、`vreduce_max` | `linalg.reduce` | reduction body 分别使用加法或最大值 Operation。 |
 | `vexp`、`vexpdif` | `linalg` 结构化逐元素操作 | 计算体使用 `math.exp`，`vexpdif` 同时保留减法。 |
 | `vcvt` | `linalg` 结构化逐元素操作 | 计算体使用相应的 `arith` cast Operation。 |

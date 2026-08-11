@@ -424,15 +424,23 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         )
 
     def _emit_vmuls(self, call: tirx.Call) -> None:
-        if len(call.args) < 3:
+        if len(call.args) != 3:
             raise ValueError(
-                f"tl.tileop.vmuls expects at least 3 arguments, but received {len(call.args)}"
+                f"tl.tileop.vmuls expects 3 arguments, but received {len(call.args)}"
             )
         src = self._get_or_create_expr_value(call.args[0])
         scalar = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
 
-        element_type = src.type.element_type
+        src_type = src.type.element_type
+        scalar_type = getattr(scalar.type, "element_type", scalar.type)
+        dst_type = dst.type.element_type
+        if not (src_type == scalar_type == dst_type):
+            raise TypeError(
+                f"tl.tileop.vmuls expects src, scalar, and dst to have the same dtype, "
+                f"but received {src_type}, {scalar_type}, and {dst_type}"
+            )
+        element_type = src_type
         identity = self._ir.AffineMap.get_identity(1)
         indexing_maps = self._ir.ArrayAttr.get([
             self._ir.AffineMapAttr.get(identity),
@@ -452,7 +460,10 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             [element_type, element_type]
         )
         with self._arith.InsertionPoint(block):
-            mul = self._arith.MulFOp(block.arguments[0], scalar)
+            if isinstance(element_type, self._ir.FloatType):
+                mul = self._arith.MulFOp(block.arguments[0], scalar)
+            else:
+                mul = self._arith.MulIOp(block.arguments[0], scalar)
             self._linalg.YieldOp([mul.result])
 
     def _cast_to_index(self, value: Any) -> Any:
