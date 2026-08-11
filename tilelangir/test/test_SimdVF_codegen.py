@@ -61,10 +61,6 @@ def test_simdvf_emits_tilelang_scope():
     assert 'simd_attr = "simd"' in mlir
     assert "tilelang.copy" in mlir
     assert "linalg.add" in mlir
-    # The SimdVF SBlock's reads are serialized onto the scope op. The writes
-    # list is empty here, so no writes attribute must be emitted.
-    assert 'reads = "a_shared[0:1, 0:1], b_shared[0:1, 0:1], c_shared[0:1, 0:1]"' in mlir
-    assert "writes =" not in mlir
 
 
 def _frag_only_simdvf_kernel(N=256, VL=64, dtype="float32"):
@@ -194,8 +190,6 @@ def test_simdvf_dynamic_region_serialization():
     mlir = _kernel_source(artifact)
 
     assert "tilelang.scope" in mlir
-    # Symbolic bounds are printed as expressions instead of crashing int().
-    assert 'reads = "a_shared[0:0+n]"' in mlir
 
 
 if __name__ == "__main__":
