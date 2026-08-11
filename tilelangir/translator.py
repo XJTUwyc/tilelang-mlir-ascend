@@ -867,6 +867,36 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.fill":
+            self._emit_fill(op)
+        elif op_name == "tl.infinity":
+            self._emit_infinity(op)
+
+
+    def _emit_fill(self, op: tirx.Call) -> None:
+        if len(op.args) != 2:
+            raise ValueError(f"tl.tileop.fill expects 2 arguments, but received {len(op.args)}")
+
+        # arg0 is a tl.tileop.region Call node that has not yet been lowered; you must use _get_or_create_expr_value.
+        # First trigger _emit_region to generate a memref view, then obtain its Value (consistent with _emit_vadd).
+        # arg1 is the fill value.
+        buffer = self._get_or_create_expr_value(op.args[0])
+        value = self._get_or_create_expr_value(op.args[1])
+        self._linalg.fill(value, outs=[buffer])
+
+
+    def _emit_infinity(self, op: tirx.Call) -> None:
+        if len(op.args) != 1:
+            raise ValueError(f"tl.infinity expects 1 argument, but received {len(op.args)}")
+
+        # op.args[0] is a StringImm (e.g., "float16"), and its .dtype is "handle",
+        # which cannot be used as the element type. The actual element dtype comes
+        # from the call's return dtype (op.dtype). This is consistent with the
+        # approach used in visit_float_imm_, which also uses op.dtype.
+        result_type = self._dtype_type(op.dtype)
+        inf_attr = self._ir.FloatAttr.get(result_type, float("inf"))
+        value = self._arith.ConstantOp(result_type, inf_attr).result
+        self._insert_value(op, value)
 
     @staticmethod
     def _call_annotations(call: tirx.Call) -> dict[str, Any]:
