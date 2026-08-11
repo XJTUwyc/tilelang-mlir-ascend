@@ -803,9 +803,9 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if len(op.args) != 2:
             raise ValueError(f"tl.tileop.fill expects 2 arguments, but received {len(op.args)}")
 
-        # arg0 是 tl.tileop.region Call 节点，尚未 lower，必须用 _get_or_create_expr_value
-        # 先触发 _emit_region 生成 memref view，再取其 Value（与 _emit_vadd 一致）。
-        # arg1 是 fill 的值。
+        # arg0 is a tl.tileop.region Call node that has not yet been lowered; you must use _get_or_create_expr_value.
+        # First trigger _emit_region to generate a memref view, then obtain its Value (consistent with _emit_vadd).
+        # arg1 is the fill value.
         buffer = self._get_or_create_expr_value(op.args[0])
         value = self._get_or_create_expr_value(op.args[1])
         self._linalg.fill(value, outs=[buffer])
@@ -815,9 +815,10 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if len(op.args) != 1:
             raise ValueError(f"tl.infinity expects 1 argument, but received {len(op.args)}")
 
-        # op.args[0] 是 StringImm（如 "float16"），它自身的 .dtype 是 "handle"，
-        # 不能用作元素类型。真正的元素 dtype 来自 call 的返回 dtype（op.dtype）。
-        # 这与 visit_float_imm_ 用 op.dtype 的写法一致。
+        # op.args[0] is a StringImm (e.g., "float16"), and its .dtype is "handle",
+        # which cannot be used as the element type. The actual element dtype comes
+        # from the call's return dtype (op.dtype). This is consistent with the
+        # approach used in visit_float_imm_, which also uses op.dtype.
         result_type = self._dtype_type(op.dtype)
         inf_attr = self._ir.FloatAttr.get(result_type, float("inf"))
         value = self._arith.ConstantOp(result_type, inf_attr).result
