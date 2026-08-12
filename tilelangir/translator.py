@@ -760,6 +760,57 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 mul = self._arith.MulIOp(block.arguments[0], scalar)
             self._linalg.YieldOp([mul.result])
 
+    def _emit_vmax(self, call: tirx.Call) -> None:
+        if len(call.args) < 3:
+            raise ValueError(
+                f"tl.tileop.vmax expects at least 3 arguments, but received {len(call.args)}"
+            )
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+
+        dst_type = dst.type
+        rank = dst_type.rank
+        element_type = dst_type.element_type
+
+        # 无符号信息仅在 TIRX 层保留（_dtype_type 把 int/uint 都压成 signless）。
+        # 从 tl.tileop.region Call 解包出 BufferLoad，读取原始 TIRX dtype。
+        tirx_dtype = None
+        arg0 = call.args[0]
+        if (
+            isinstance(arg0, tirx.Call)
+            and arg0.op.name == "tl.tileop.region"
+            and isinstance(arg0.args[0], tirx.BufferLoad)
+        ):
+            tirx_dtype = str(arg0.args[0].buffer.dtype)
+
+        indexing_map = self._ir.AffineMap.get(
+            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
+        )
+        indexing_maps = self._ir.ArrayAttr.get(
+            [self._ir.AffineMapAttr.get(indexing_map)] * 3
+        )
+        iterator_types = self._ir.ArrayAttr.get(
+            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+        )
+        generic = self._linalg.GenericOp(
+            result_tensors=[],
+            inputs=[src0, src1],
+            outputs=[dst],
+            indexing_maps=indexing_maps,
+            iterator_types=iterator_types,
+        )
+        block = generic.regions[0].blocks.append(element_type, element_type, element_type)
+        with self._ir.InsertionPoint(block):
+            # 按 dtype 选择 max op：浮点用 maximumf，无符号整型用 maxui，有符号/其余用 maxsi。
+            if isinstance(element_type, self._ir.FloatType):
+                max_op = self._arith.MaximumFOp(block.arguments[0], block.arguments[1])
+            elif tirx_dtype is not None and tirx_dtype.startswith("uint"):
+                max_op = self._arith.MaxUIOp(block.arguments[0], block.arguments[1])
+            else:
+                max_op = self._arith.MaxSIOp(block.arguments[0], block.arguments[1])
+            self._linalg.YieldOp([max_op.result])
+
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
         if value.type == index_type:
@@ -1168,6 +1219,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.vmax":
+            self._emit_vmax(op)
         elif op_name == "tl.tileop.vmuls":
             self._emit_vmuls(op)
         elif op_name == "tl.tileop.fill":
