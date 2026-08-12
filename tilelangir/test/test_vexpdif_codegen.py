@@ -54,6 +54,21 @@ def _vexpdif_kernel(
     return main
 
 
+def _vexpdif_scalar_offset_kernel(VL: int = 64):
+    """Build ``dst = exp(src - scalar)`` with a rank-zero region operand."""
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1):
+            with T.SimdVF():
+                src = T.alloc_fragment((VL,), "float32")
+                offset = T.alloc_fragment((1,), "float32")
+                dst = T.alloc_fragment((VL,), "float32")
+                T.vexpdif(src, offset, dst)
+
+    return main
+
+
 def _lower_to_tile_source(kernel) -> str:
     """Lower ``kernel`` to tile target and return the generated MLIR source."""
     artifact = tilelang.lower(kernel, target="tile")
@@ -114,6 +129,14 @@ def test_vexpdif_emits_linalg_generic():
     source = _lower_to_tile_source(_vexpdif_kernel())
     block = _extract_vexpdif_block(source)
     assert "linalg.generic" in block
+
+
+def test_vexpdif_broadcasts_rank_zero_offset():
+    """A one-element fragment must use an empty affine map for broadcasting."""
+    source = _lower_to_tile_source(_vexpdif_scalar_offset_kernel())
+    assert "affine_map<(d0) -> ()>" in source
+    _assert_body_op(_extract_vexpdif_block(source), "arith.subf")
+    _assert_body_op(_extract_vexpdif_block(source), "math.exp")
 
 
 def test_vexpdif_body_uses_arith_subf():

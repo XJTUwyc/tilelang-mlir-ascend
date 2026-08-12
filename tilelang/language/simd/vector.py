@@ -120,9 +120,13 @@ def vreduce_sum(src: OperandType, dst: OperandType) -> tirx.PrimExpr:
     return _reduce_vector_op("vreduce_sum", src, dst)
 
 
-def vexp(src: OperandType, offset: OperandType, dst: OperandType) -> tirx.PrimExpr:
-    """Preserve a vector exponential operation in Core TIRX."""
-    return _binary_vector_op("vexp", src, offset, dst)
+def vexp(src: OperandType, dst: OperandType) -> tirx.PrimExpr:
+    """Apply the exponential function elementwise to a vector region."""
+    return _call_vector_op(
+        "vexp",
+        _normalize_operand(src, access_type="r"),
+        _normalize_operand(dst, access_type="w"),
+    )
 
 
 def vexpdif(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExpr:
