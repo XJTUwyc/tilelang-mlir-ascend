@@ -388,6 +388,150 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
 
+    def _emit_vreduce_max(self, call: tirx.Call) -> None:
+        if len(call.args) != 2:
+            raise ValueError(f"tl.tileop.vreduce_max expects 2 arguments, but received {len(call.args)}")
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        dtype_name = self._call_arg_dtype_name(call.args[0])
+        self._emit_linalg_reduce(src, dst, "maxf", dtype_name)
+
+    def _emit_vreduce_sum(self, call: tirx.Call) -> None:
+        if len(call.args) != 2:
+            raise ValueError(f"tl.tileop.vreduce_sum expects 2 arguments, but received {len(call.args)}")
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        dtype_name = self._call_arg_dtype_name(call.args[0])
+        self._emit_linalg_reduce(src, dst, "addf", dtype_name)
+
+    def _emit_linalg_reduce(self, src: Any, dst: Any, kind: str, dtype_name: str) -> None:
+        src_type = self._ir.MemRefType(src.type)
+        dst_type = self._ir.MemRefType(dst.type)
+        element_type = src_type.element_type
+        is_float = isinstance(element_type, self._ir.FloatType)
+
+        dim = src_type.rank - 1
+        result_shape = list(src_type.shape)
+        del result_shape[dim]
+
+        src_tensor_type = self._ir.RankedTensorType.get(src_type.shape, element_type)
+        src_tensor = self._ir.Operation.create(
+            "bufferization.to_tensor",
+            results=[src_tensor_type],
+            operands=[src],
+        ).result
+
+        if is_float:
+            if kind == "maxf":
+                identity_val = float("-inf")
+            else:
+                identity_val = 0.0
+            identity_attr = self._ir.FloatAttr.get(element_type, identity_val)
+        else:
+            if kind == "maxf":
+                if dtype_name.startswith("uint"):
+                    identity_val = 0
+                else:
+                    bit_width = element_type.width
+                    identity_val = -(1 << (bit_width - 1))
+            else:
+                identity_val = 0
+            identity_attr = self._ir.IntegerAttr.get(element_type, identity_val)
+
+        def _build_body(body: Any) -> None:
+            with self._ir.InsertionPoint(body):
+                if is_float:
+                    if kind == "maxf":
+                        val = self._arith.MaximumFOp(body.arguments[0], body.arguments[1]).result
+                    else:
+                        val = self._arith.AddFOp(body.arguments[0], body.arguments[1]).result
+                else:
+                    if kind == "maxf":
+                        if dtype_name.startswith("uint"):
+                            val = self._arith.MaxUIOp(body.arguments[0], body.arguments[1]).result
+                        else:
+                            val = self._arith.MaxSIOp(body.arguments[0], body.arguments[1]).result
+                    else:
+                        val = self._arith.AddIOp(body.arguments[0], body.arguments[1]).result
+                self._ir.Operation.create("linalg.yield", results=[], operands=[val])
+
+        if len(result_shape) == 0:
+            init_type = self._ir.RankedTensorType.get([], element_type)
+            gen_op = self._ir.Operation.create(
+                "tensor.generate", results=[init_type], operands=[], regions=1,
+            )
+            gen_body = gen_op.regions[0].blocks.append()
+            with self._ir.InsertionPoint(gen_body):
+                cst = self._arith.ConstantOp(element_type, identity_attr).result
+                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
+            init_tensor = gen_op.result
+
+            reduce_op = self._ir.Operation.create(
+                "linalg.reduce",
+                results=[init_type],
+                operands=[src_tensor, init_tensor],
+                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
+                regions=1,
+            )
+            _build_body(reduce_op.regions[0].blocks.append(element_type, element_type))
+
+            dst_tensor_type = self._ir.RankedTensorType.get(dst_type.shape, element_type)
+            dst_empty = self._ir.Operation.create(
+                "tensor.empty", results=[dst_tensor_type]
+            ).result
+            insert_op = self._ir.Operation.create(
+                "tensor.insert_slice",
+                results=[dst_tensor_type],
+                operands=[reduce_op.result, dst_empty],
+                attributes={
+                    "static_offsets": self._ir.DenseI64ArrayAttr.get([]),
+                    "static_sizes": self._ir.DenseI64ArrayAttr.get([]),
+                    "static_strides": self._ir.DenseI64ArrayAttr.get([]),
+                    "operandSegmentSizes": self._ir.DenseI32ArrayAttr.get([1, 1, 0, 0, 0]),
+                },
+            )
+            self._ir.Operation.create(
+                "bufferization.materialize_in_destination",
+                results=[],
+                operands=[insert_op.result, dst],
+                attributes={"writable": self._ir.UnitAttr.get()},
+            )
+        else:
+            init_type = self._ir.RankedTensorType.get(result_shape, element_type)
+            gen_op = self._ir.Operation.create(
+                "tensor.generate", results=[init_type], operands=[], regions=1,
+            )
+            gen_body = gen_op.regions[0].blocks.append()
+            with self._ir.InsertionPoint(gen_body):
+                cst = self._arith.ConstantOp(element_type, identity_attr).result
+                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
+            init_tensor = gen_op.result
+
+            reduce_op = self._ir.Operation.create(
+                "linalg.reduce",
+                results=[init_type],
+                operands=[src_tensor, init_tensor],
+                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
+                regions=1,
+            )
+            _build_body(reduce_op.regions[0].blocks.append(element_type, element_type))
+
+            self._ir.Operation.create(
+                "bufferization.materialize_in_destination",
+                results=[],
+                operands=[reduce_op.result, dst],
+                attributes={"writable": self._ir.UnitAttr.get()},
+            )
+
+    @staticmethod
+    def _call_arg_dtype_name(arg: Any) -> str:
+        """Extract the dtype name string from a TIRX call argument."""
+        if hasattr(arg, "buffer") and hasattr(arg.buffer, "dtype"):
+            return str(arg.buffer.dtype)
+        if hasattr(arg, "dtype"):
+            return str(arg.dtype)
+        return "float32"
+
     def _emit_vexpdif(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(
@@ -1014,6 +1158,10 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_region(op)
         elif op_name == "tl.tileop.vadd":
             self._emit_vadd(op)
+        elif op_name == "tl.tileop.vreduce_max":
+            self._emit_vreduce_max(op)
+        elif op_name == "tl.tileop.vreduce_sum":
+            self._emit_vreduce_sum(op)
         elif op_name == "tl.tileop.vexpdif":
             self._emit_vexpdif(op)
         elif op_name == "tl.tileop.copy":
