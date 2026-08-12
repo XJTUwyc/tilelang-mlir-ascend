@@ -573,6 +573,49 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                         f"unreachable int->int same-width cast: {src_type} -> {dst_type}"
                     )
 
+    def _emit_vmuls(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(
+                f"tl.tileop.vmuls expects 3 arguments, but received {len(call.args)}"
+            )
+        src = self._get_or_create_expr_value(call.args[0])
+        scalar = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+
+        src_type = src.type.element_type
+        scalar_type = getattr(scalar.type, "element_type", scalar.type)
+        dst_type = dst.type.element_type
+        if not (src_type == scalar_type == dst_type):
+            raise TypeError(
+                f"tl.tileop.vmuls expects src, scalar, and dst to have the same dtype, "
+                f"but received {src_type}, {scalar_type}, and {dst_type}"
+            )
+        element_type = src_type
+        identity = self._ir.AffineMap.get_identity(1)
+        indexing_maps = self._ir.ArrayAttr.get([
+            self._ir.AffineMapAttr.get(identity),
+            self._ir.AffineMapAttr.get(identity),
+        ])
+        iterator_types = [self._ir.StringAttr.get("parallel")]
+        generic = self._linalg.GenericOp(
+            [],
+            [src],
+            [dst],
+            indexing_maps,
+            iterator_types
+        )
+        body_region = generic.regions[0]
+        block = self._ir.Block.create_at_start(
+            body_region,
+            [element_type, element_type]
+        )
+        with self._arith.InsertionPoint(block):
+            if isinstance(element_type, self._ir.FloatType):
+                mul = self._arith.MulFOp(block.arguments[0], scalar)
+            else:
+                mul = self._arith.MulIOp(block.arguments[0], scalar)
+            self._linalg.YieldOp([mul.result])
+
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
         if value.type == index_type:
@@ -977,6 +1020,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.vmuls":
+            self._emit_vmuls(op)
         elif op_name == "tl.tileop.fill":
             self._emit_fill(op)
         elif op_name == "tl.infinity":
