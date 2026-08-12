@@ -768,6 +768,40 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 mul = self._arith.MulIOp(block.arguments[0], scalar)
             self._linalg.YieldOp([mul.result])
 
+    def _emit_vexp(self, call: tirx.Call) -> None:
+        if len(call.args) < 3:
+            raise ValueError(
+                f"tl.tileop.vexp expects at least 3 arguments, but received {len(call.args)}"
+            )
+        src = self._get_or_create_expr_value(call.args[0])
+        offset = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+
+        element_type = src.type.element_type
+        identity = self._ir.AffineMap.get_identity(1)
+        indexing_maps = self._ir.ArrayAttr.get([
+            self._ir.AffineMapAttr.get(identity),
+            self._ir.AffineMapAttr.get(identity),
+            self._ir.AffineMapAttr.get(identity)
+        ])
+        iterator_types = [self._ir.StringAttr.get("parallel")]
+        generic = self._linalg.GenericOp(
+            [],
+            [src, offset],
+            [dst],
+            indexing_maps,
+            iterator_types
+        )
+        body_region = generic.regions[0]
+        block = self._ir.Block.create_at_start(
+            body_region,
+            [element_type, element_type, element_type]
+        )
+        with self._arith.InsertionPoint(block):
+            sub = self._arith.SubFOp(block.arguments[0], block.arguments[1])
+            exp = self._math.ExpOp(sub.result)
+            self._linalg.YieldOp([exp.result])
+            
     def _emit_vmax(self, call: tirx.Call) -> None:
         if len(call.args) < 3:
             raise ValueError(
@@ -1229,6 +1263,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tl.tileop.vexp":
+            self._emit_vexp(op)
         elif op_name == "tl.tileop.vmax":
             self._emit_vmax(op)
         elif op_name == "tl.tileop.vmuls":
