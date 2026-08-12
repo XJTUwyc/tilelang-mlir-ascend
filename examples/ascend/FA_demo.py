@@ -63,7 +63,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                 T.copy(acc_s, S_ub, split_dim=-1)
 
                 scale_ln2 = scale * 0.6931471805599453
-                ROWS = BR
+                ROWS = BR // 2
                 VL = 64
 
                 with T.SimdVF():
@@ -96,8 +96,8 @@ def flash_attention(D=128, SEQ_LEN=4096):
                         # new_max = max(frag_0, frag_1, m_frag)
                         T.vmax(row_max_frag_0, m_frag, m_new_frag)
                         T.vmax(row_max_frag_1, m_new_frag, m_new_frag)
-                        T.vexp(S_frag_0, m_new_frag, P_frag_0)
-                        T.vexp(S_frag_1, m_new_frag, P_frag_1)
+                        T.vexpdif(S_frag_0, m_new_frag, P_frag_0)
+                        T.vexpdif(S_frag_1, m_new_frag, P_frag_1)
                         T.vcvt(P_frag_0, P_bf16_frag_0, dtype)
                         T.vcvt(P_frag_1, P_bf16_frag_1, dtype)
 

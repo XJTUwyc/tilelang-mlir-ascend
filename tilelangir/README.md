@@ -7,6 +7,20 @@
 
 ### 1. 转换为已有 MLIR 方言
 
+已有 MLIR 方言的选择遵循以下原则：
+
+1. 如果 `linalg` 有与 TileLang 操作语义对应的 Operation，并且各参数 shape
+   一致，则直接转换为对应的 `linalg` Operation。
+2. 如果参数 shape 不一致但存在明确的逐元素或广播关系，则转换为
+   `linalg.generic`，并在计算 Region 中使用 `arith`、`math` 等标量
+   Operation 表达具体计算。例如 `vmuls` 的向量乘标量；后续 `vadd` 遇到
+   可表达的不同 shape 时也应采用该方式，而不是直接失败。
+3. 如果 `linalg` 有对应 Operation，且该操作天然具有不同的输入、输出
+   shape，例如 reduction，则转换为 `linalg.reduce` 等对应结构化 Operation。
+4. 如果 `linalg` 没有能够完整对应语义的 Operation，则转换为
+   `linalg.generic`，并在计算 Region 中使用相应的 `arith`、`math` 等已有
+   MLIR Operation 表达计算。
+
 | TIRX / TileLang 语义 | 目标 MLIR 表示 | 说明 |
 | --- | --- | --- |
 | `IRModule` | `builtin.module` | 整个 Codegen 结果的顶层容器。 |
@@ -30,7 +44,8 @@
 | `vmuls` | `linalg` 结构化逐元素操作 | 向量与标量逐元素相乘；标量计算体根据其dtype使用 `arith` 的 `MulFOp`/`MulIOp` |
 | `vadd`、`vmul`、`vmax` | `linalg` 结构化逐元素操作 | 标量计算体使用 `arith` Operation；不在 Codegen 中融合这些操作。 |
 | `vreduce_sum`、`vreduce_max` | `linalg.reduce` | reduction body 分别使用加法或最大值 Operation。 |
-| `vexp`、`vexpdif` | `linalg` 结构化逐元素操作 | 计算体使用 `math.exp`，`vexpdif` 同时保留减法。 |
+| `vexp` | `linalg.exp` | 对同 shape 的输入、输出执行逐元素指数计算。 |
+| `vexpdif` | `linalg.generic` | 计算 Region 使用 `arith.subf` 和 `math.exp`，并通过 indexing map 表达标量广播。 |
 | `vcvt` | `linalg` 结构化逐元素操作 | 计算体使用相应的 `arith` cast Operation。 |
 
 `shared.dyn`、`local.fragment` 等 scope 当前不设计成自定义 MLIR 类型或自定义

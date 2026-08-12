@@ -48,7 +48,7 @@ TVM_REGISTER_OP("tl.tileop.vreduce_sum")
                                Integer(CallEffectKind::kOpaque));
 
 TVM_REGISTER_OP("tl.tileop.vexp")
-    .set_num_inputs(3)
+    .set_num_inputs(2)
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "vexp")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

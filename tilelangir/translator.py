@@ -540,6 +540,38 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             return str(arg.dtype)
         return "float32"
 
+    def _elementwise_indexing_maps(self, inputs: list[Any], dst: Any) -> Any:
+        """Build indexing maps for same-shape and scalar-broadcast operands.
+
+        The output defines the elementwise iteration space. An input with the
+        same shape uses the identity map, while a rank-zero input uses an empty
+        result map and is therefore broadcast across that iteration space.
+        Other shape relationships are intentionally left for the general
+        elementwise broadcasting work.
+        """
+        dst_type = self._ir.MemRefType(dst.type)
+        rank = dst_type.rank
+        dimensions = [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
+        identity = self._ir.AffineMap.get(rank, 0, dimensions)
+        scalar = self._ir.AffineMap.get(rank, 0, [])
+
+        maps = []
+        for operand in inputs:
+            operand_type = self._ir.MemRefType(operand.type)
+            if tuple(operand_type.shape) == tuple(dst_type.shape):
+                operand_map = identity
+            elif operand_type.rank == 0:
+                operand_map = scalar
+            else:
+                raise ValueError(
+                    "Unsupported elementwise shape relationship: "
+                    f"input {operand_type.shape}, output {dst_type.shape}"
+                )
+            maps.append(self._ir.AffineMapAttr.get(operand_map))
+
+        maps.append(self._ir.AffineMapAttr.get(identity))
+        return self._ir.ArrayAttr.get(maps)
+
     def _emit_vexpdif(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(
@@ -549,16 +581,13 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
 
-        dst_type = dst.type
+        src0_type = self._ir.MemRefType(src0.type)
+        src1_type = self._ir.MemRefType(src1.type)
+        dst_type = self._ir.MemRefType(dst.type)
         rank = dst_type.rank
         element_type = dst_type.element_type
 
-        indexing_map = self._ir.AffineMap.get(
-            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
-        )
-        indexing_maps = self._ir.ArrayAttr.get(
-            [self._ir.AffineMapAttr.get(indexing_map)] * 3
-        )
+        indexing_maps = self._elementwise_indexing_maps([src0, src1], dst)
         iterator_types = self._ir.ArrayAttr.get(
             [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
         )
@@ -569,7 +598,11 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             indexing_maps=indexing_maps,
             iterator_types=iterator_types,
         )
-        block = generic.regions[0].blocks.append(element_type, element_type, element_type)
+        block = generic.regions[0].blocks.append(
+            src0_type.element_type,
+            src1_type.element_type,
+            element_type,
+        )
         with self._ir.InsertionPoint(block):
             diff = self._arith.SubFOp(block.arguments[0], block.arguments[1]).result
             result = self._math.ExpOp(diff).result
@@ -769,38 +802,21 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._linalg.YieldOp([mul.result])
 
     def _emit_vexp(self, call: tirx.Call) -> None:
-        if len(call.args) < 3:
+        if len(call.args) != 2:
             raise ValueError(
-                f"tl.tileop.vexp expects at least 3 arguments, but received {len(call.args)}"
+                f"tl.tileop.vexp expects 2 arguments, but received {len(call.args)}"
             )
         src = self._get_or_create_expr_value(call.args[0])
-        offset = self._get_or_create_expr_value(call.args[1])
-        dst = self._get_or_create_expr_value(call.args[2])
+        dst = self._get_or_create_expr_value(call.args[1])
 
-        element_type = src.type.element_type
-        identity = self._ir.AffineMap.get_identity(1)
-        indexing_maps = self._ir.ArrayAttr.get([
-            self._ir.AffineMapAttr.get(identity),
-            self._ir.AffineMapAttr.get(identity),
-            self._ir.AffineMapAttr.get(identity)
-        ])
-        iterator_types = [self._ir.StringAttr.get("parallel")]
-        generic = self._linalg.GenericOp(
-            [],
-            [src, offset],
-            [dst],
-            indexing_maps,
-            iterator_types
-        )
-        body_region = generic.regions[0]
-        block = self._ir.Block.create_at_start(
-            body_region,
-            [element_type, element_type, element_type]
-        )
-        with self._arith.InsertionPoint(block):
-            sub = self._arith.SubFOp(block.arguments[0], block.arguments[1])
-            exp = self._math.ExpOp(sub.result)
-            self._linalg.YieldOp([exp.result])
+        src_type = self._ir.MemRefType(src.type)
+        dst_type = self._ir.MemRefType(dst.type)
+        if tuple(src_type.shape) != tuple(dst_type.shape):
+            raise ValueError(
+                "tl.tileop.vexp expects src and dst to have the same shape, "
+                f"but received {src_type.shape} and {dst_type.shape}"
+            )
+        self._linalg.exp(src, outs=[dst])
             
     def _emit_vmax(self, call: tirx.Call) -> None:
         if len(call.args) < 3:
@@ -1333,4 +1349,3 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if isinstance(expr, int):
             return expr
         return None
-
