@@ -388,6 +388,14 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.add(src0, src1, outs=[dst])
 
+    def _emit_vmul(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(f"tl.tileop.vmul expects 3 arguments, but received {len(call.args)}")
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+        self._linalg.mul(src0, src1, outs=[dst])
+
     def _emit_vreduce_max(self, call: tirx.Call) -> None:
         if len(call.args) != 2:
             raise ValueError(f"tl.tileop.vreduce_max expects 2 arguments, but received {len(call.args)}")
@@ -1209,6 +1217,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_region(op)
         elif op_name == "tl.tileop.vadd":
             self._emit_vadd(op)
+        elif op_name == "tl.tileop.vmul":
+            self._emit_vmul(op)
         elif op_name == "tl.tileop.vreduce_max":
             self._emit_vreduce_max(op)
         elif op_name == "tl.tileop.vreduce_sum":
