@@ -16,8 +16,9 @@
 #ifndef TILELANG_DIALECT_IR_TILELANGOPS_TD
 #define TILELANG_DIALECT_IR_TILELANGOPS_TD
 
-include "TileLang/IR/TileLangDialect.td"
+include "TileLangDialect.td"
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class TileLang_Op<string mnemonic, list<Trait> traits = []>
     : Op<TileLang_Dialect, mnemonic, traits>;
@@ -39,8 +40,8 @@ def TileLang_CopyOp : TileLang_Op<"copy"> {
   }];
 
   let arguments = (ins
-    AnyMemRef:$src,
-    AnyMemRef:$dest,
+    Arg<AnyMemRef, "source memref", [MemRead]>:$src,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dest,
     OptionalAttr<I64Attr>:$split_dim,
     OptionalAttr<UnitAttr>:$transpose
   );
@@ -63,9 +64,9 @@ def TileLang_GemmOp : TileLang_Op<"gemm"> {
   }];
 
   let arguments = (ins
-    AnyMemRef:$a,
-    AnyMemRef:$b,
-    AnyMemRef:$c,
+    Arg<AnyMemRef, "A matrix memref", [MemRead]>:$a,
+    Arg<AnyMemRef, "B matrix memref", [MemRead]>:$b,
+    Arg<AnyMemRef, "C accumulator memref", [MemRead, MemWrite]>:$c,
     OptionalAttr<UnitAttr>:$transpose_a,
     OptionalAttr<UnitAttr>:$transpose_b,
     OptionalAttr<UnitAttr>:$clear_accum
@@ -81,12 +82,14 @@ def TileLang_GemmOp : TileLang_Op<"gemm"> {
 // Matches Python: ScopeOp(*, simd_attr=None) with body region
 // Generic form: "tilelang.scope"() ({ ... }) {simd_attr = "simd"} : () -> ()
 // ---------------------------------------------------------------------------
-def TileLang_ScopeOp : TileLang_Op<"scope"> {
+def TileLang_ScopeOp : TileLang_Op<"scope", [NoTerminator]> {
   let summary = "TileLang frontend scope (e.g. SimdVF)";
   let description = [{
     `tilelang.scope` wraps a body region for a frontend scope such as SimdVF.
     When `simd_attr` is set (for example to `"simd"`), it identifies the scope
-    kind for downstream lowering.
+    kind for downstream lowering. The body region carries no terminator: the
+    Python translator emits it without a `tilelang.scope_yield`, so the
+    lowering to `npu.scope` must synthesize the `npu.yield` itself.
 
     Emitted by the TileLang Python translator for TIRX SBlocks named `SimdVF`.
   }];

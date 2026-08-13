@@ -88,14 +88,45 @@ LogicalResult GemmOp::verify() {
            << getC().getType();
   }
 
-  // Element types must be consistent.
+  // A and B are the multiply operands and must share the same element type.
+  // C is the accumulator/output and may use a different (e.g. higher-precision)
+  // element type, mirroring npu.mad semantics.
   Type elemA = aType.getElementType();
   Type elemB = bType.getElementType();
-  Type elemC = cType.getElementType();
-  if (elemA != elemB || elemA != elemC) {
-    return emitOpError("all operand element types must match: ")
-           << elemA << ", " << elemB << ", " << elemC;
+  if (elemA != elemB) {
+    return emitOpError("operand 'a' and 'b' element types must match: ")
+           << elemA << " vs " << elemB;
   }
+
+  // M×K×N consistency, accounting for optional transposes. Physical shapes are
+  // A: [M, K] (or [K, M] when transpose_a), B: [K, N] (or [N, K] when
+  // transpose_b), C: [M, N]. This mirrors the NpuToCCE mad convention.
+  ArrayRef<int64_t> aShape = aType.getShape();
+  ArrayRef<int64_t> bShape = bType.getShape();
+  ArrayRef<int64_t> cShape = cType.getShape();
+  if (aShape.size() != 2 || bShape.size() != 2 || cShape.size() != 2)
+    return emitOpError("gemm operands must all be rank-2 memrefs");
+
+  int64_t m = cShape[0];
+  int64_t n = cShape[1];
+  int64_t aRows = getTransposeA() ? aShape[1] : aShape[0];
+  int64_t k = getTransposeA() ? aShape[0] : aShape[1];
+  int64_t bK = getTransposeB() ? bShape[1] : bShape[0];
+  int64_t bCols = getTransposeB() ? bShape[0] : bShape[1];
+
+  auto checkDim = [&](int64_t lhs, int64_t rhs,
+                      StringRef what) -> LogicalResult {
+    if (ShapedType::isDynamic(lhs) || ShapedType::isDynamic(rhs))
+      return success();
+    if (lhs != rhs)
+      return emitOpError("incompatible ") << what
+                                          << " dimension: " << lhs << " vs "
+                                          << rhs;
+    return success();
+  };
+  if (failed(checkDim(aRows, m, "M")) || failed(checkDim(bK, k, "K")) ||
+      failed(checkDim(bCols, n, "N")))
+    return failure();
 
   return success();
 }
