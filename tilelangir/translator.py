@@ -418,17 +418,17 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         element_type = src_type.element_type
         is_float = isinstance(element_type, self._ir.FloatType)
 
-        dim = src_type.rank - 1
-        result_shape = list(src_type.shape)
-        del result_shape[dim]
+        src_shape = list(src_type.shape)
+        dst_shape = list(dst_type.shape)
 
-        src_tensor_type = self._ir.RankedTensorType.get(src_type.shape, element_type)
-        src_tensor = self._ir.Operation.create(
-            "bufferization.to_tensor",
-            results=[src_tensor_type],
-            operands=[src],
-        ).result
+        # Infer reduction dimensions by comparing src and dst shapes,
+        # instead of hardcoding the last dimension.
+        reduce_dims = self._infer_reduce_dims(src_shape, dst_shape)
 
+        # Compute the expected init shape (src shape with reduce_dims removed).
+        init_shape = [src_shape[i] for i in range(len(src_shape)) if i not in reduce_dims]
+
+        # Create the identity constant value.
         if is_float:
             if kind == "maxf":
                 identity_val = float("-inf")
@@ -445,91 +445,98 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             else:
                 identity_val = 0
             identity_attr = self._ir.IntegerAttr.get(element_type, identity_val)
+        identity_const = self._arith.ConstantOp(element_type, identity_attr).result
 
-        def _build_body(body: Any) -> None:
-            with self._ir.InsertionPoint(body):
-                if is_float:
-                    if kind == "maxf":
-                        val = self._arith.MaximumFOp(body.arguments[0], body.arguments[1]).result
-                    else:
-                        val = self._arith.AddFOp(body.arguments[0], body.arguments[1]).result
-                else:
-                    if kind == "maxf":
-                        if dtype_name.startswith("uint"):
-                            val = self._arith.MaxUIOp(body.arguments[0], body.arguments[1]).result
-                        else:
-                            val = self._arith.MaxSIOp(body.arguments[0], body.arguments[1]).result
-                    else:
-                        val = self._arith.AddIOp(body.arguments[0], body.arguments[1]).result
-                self._ir.Operation.create("linalg.yield", results=[], operands=[val])
-
-        if len(result_shape) == 0:
-            init_type = self._ir.RankedTensorType.get([], element_type)
-            gen_op = self._ir.Operation.create(
-                "tensor.generate", results=[init_type], operands=[], regions=1,
-            )
-            gen_body = gen_op.regions[0].blocks.append()
-            with self._ir.InsertionPoint(gen_body):
-                cst = self._arith.ConstantOp(element_type, identity_attr).result
-                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
-            init_tensor = gen_op.result
-
-            reduce_op = self._ir.Operation.create(
-                "linalg.reduce",
-                results=[init_type],
-                operands=[src_tensor, init_tensor],
-                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
-                regions=1,
-            )
-            _build_body(reduce_op.regions[0].blocks.append(element_type, element_type))
-
-            dst_tensor_type = self._ir.RankedTensorType.get(dst_type.shape, element_type)
-            dst_empty = self._ir.Operation.create(
-                "tensor.empty", results=[dst_tensor_type]
-            ).result
-            insert_op = self._ir.Operation.create(
-                "tensor.insert_slice",
-                results=[dst_tensor_type],
-                operands=[reduce_op.result, dst_empty],
-                attributes={
-                    "static_offsets": self._ir.DenseI64ArrayAttr.get([]),
-                    "static_sizes": self._ir.DenseI64ArrayAttr.get([]),
-                    "static_strides": self._ir.DenseI64ArrayAttr.get([]),
-                    "operandSegmentSizes": self._ir.DenseI32ArrayAttr.get([1, 1, 0, 0, 0]),
-                },
-            )
-            self._ir.Operation.create(
-                "bufferization.materialize_in_destination",
-                results=[],
-                operands=[insert_op.result, dst],
-                attributes={"writable": self._ir.UnitAttr.get()},
-            )
+        # Prepare the init buffer: use dst directly if shapes match,
+        # otherwise create a rank-reduced view of dst.
+        if init_shape == dst_shape:
+            init = dst
         else:
-            init_type = self._ir.RankedTensorType.get(result_shape, element_type)
-            gen_op = self._ir.Operation.create(
-                "tensor.generate", results=[init_type], operands=[], regions=1,
-            )
-            gen_body = gen_op.regions[0].blocks.append()
-            with self._ir.InsertionPoint(gen_body):
-                cst = self._arith.ConstantOp(element_type, identity_attr).result
-                self._ir.Operation.create("tensor.yield", results=[], operands=[cst])
-            init_tensor = gen_op.result
+            init = self._create_rank_reduced_view(dst, dst_type, init_shape, element_type)
 
-            reduce_op = self._ir.Operation.create(
-                "linalg.reduce",
-                results=[init_type],
-                operands=[src_tensor, init_tensor],
-                attributes={"dimensions": self._ir.DenseI64ArrayAttr.get([dim])},
-                regions=1,
-            )
-            _build_body(reduce_op.regions[0].blocks.append(element_type, element_type))
+        # Fill the init buffer with the identity value using linalg.fill.
+        self._linalg.fill(identity_const, outs=[init])
 
-            self._ir.Operation.create(
-                "bufferization.materialize_in_destination",
-                results=[],
-                operands=[reduce_op.result, dst],
-                attributes={"writable": self._ir.UnitAttr.get()},
+        # Create linalg.reduce with memref semantics (no tensor conversions).
+        reduce_op = self._ir.Operation.create(
+            "linalg.reduce",
+            results=[],
+            operands=[src, init],
+            attributes={"dimensions": self._ir.DenseI64ArrayAttr.get(reduce_dims)},
+            regions=1,
+        )
+
+        # Build the combiner body.
+        body = reduce_op.regions[0].blocks.append(element_type, element_type)
+        with self._ir.InsertionPoint(body):
+            if is_float:
+                if kind == "maxf":
+                    val = self._arith.MaximumFOp(body.arguments[0], body.arguments[1]).result
+                else:
+                    val = self._arith.AddFOp(body.arguments[0], body.arguments[1]).result
+            else:
+                if kind == "maxf":
+                    if dtype_name.startswith("uint"):
+                        val = self._arith.MaxUIOp(body.arguments[0], body.arguments[1]).result
+                    else:
+                        val = self._arith.MaxSIOp(body.arguments[0], body.arguments[1]).result
+                else:
+                    val = self._arith.AddIOp(body.arguments[0], body.arguments[1]).result
+            self._ir.Operation.create("linalg.yield", results=[], operands=[val])
+
+    @staticmethod
+    def _infer_reduce_dims(
+        src_shape: list[int], dst_shape: list[int]
+    ) -> list[int]:
+        """Infer which dimensions of src are reduced by comparing with dst shape."""
+        if len(dst_shape) == 0:
+            # All dimensions are reduced.
+            return list(range(len(src_shape)))
+        if len(dst_shape) == len(src_shape):
+            # Same rank: dims where sizes differ are the reduction dims.
+            return [i for i in range(len(src_shape)) if src_shape[i] != dst_shape[i]]
+        # Different rank: match from right to left to find kept dims.
+        reduce_dims: list[int] = []
+        dst_idx = len(dst_shape) - 1
+        for src_idx in range(len(src_shape) - 1, -1, -1):
+            if dst_idx >= 0 and src_shape[src_idx] == dst_shape[dst_idx]:
+                dst_idx -= 1
+            else:
+                reduce_dims.append(src_idx)
+        reduce_dims.reverse()
+        return reduce_dims
+
+    def _create_rank_reduced_view(
+        self, dst: Any, dst_type: Any, init_shape: list[int], element_type: Any
+    ) -> Any:
+        """Create a rank-reduced memref view of dst matching init_shape."""
+        memory_space = dst_type.memory_space
+        if len(init_shape) == 0:
+            # Scalar result: create a rank-0 view of dst's first element.
+            init_type = self._ir.MemRefType.get(
+                [],
+                element_type,
+                layout=self._ir.StridedLayoutAttr.get(0, []),
+                memory_space=memory_space,
             )
+            return self._memref.ReinterpretCastOp(
+                init_type, dst, [], [], [], [0], [], []
+            ).result
+        # Compute contiguous strides for the init shape.
+        strides: list[int] = []
+        stride = 1
+        for size in reversed(init_shape):
+            strides.insert(0, stride)
+            stride *= size
+        init_type = self._ir.MemRefType.get(
+            init_shape,
+            element_type,
+            layout=self._ir.StridedLayoutAttr.get(0, strides),
+            memory_space=memory_space,
+        )
+        return self._memref.ReinterpretCastOp(
+            init_type, dst, [], [], [], [0], init_shape, strides
+        ).result
 
     @staticmethod
     def _call_arg_dtype_name(arg: Any) -> str:
