@@ -1,15 +1,23 @@
+"""TileLangIR ``tl.tileop.vmul`` codegen tests."""
+
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
-def vmul(M=1024, N=256, block_M=32):
+
+def _vmul_kernel(
+    M: int = 1024,
+    N: int = 256,
+    block_M: int = 32,
+    dtype: str = "float32",
+):
     num_blocks = M // block_M
-    dtype="float32"
 
     @T.prim_func
     def main(
-        A: T.Buffer((M, N), dtype),
-        B: T.Buffer((M, N), dtype),
-        C: T.Buffer((M, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(num_blocks) as bx:
             a_shared = T.alloc_shared((block_M, N), dtype)
@@ -17,8 +25,8 @@ def vmul(M=1024, N=256, block_M=32):
             c_shared = T.alloc_shared((block_M, N), dtype)
             T.copy(A[bx * block_M : (bx + 1) * block_M, 0:N], a_shared)
             T.copy(B[bx * block_M : (bx + 1) * block_M, 0:N], b_shared)
-            
-            VL=64 
+
+            VL = 64
 
             with T.SimdVF():
                 for r in range(0, block_M):
@@ -38,14 +46,28 @@ def vmul(M=1024, N=256, block_M=32):
 
     return main
 
+
+def _kernel_source(artifact) -> str:
+    source = getattr(artifact, "kernel_source", None)
+    if source:
+        return str(source)
+    device_mod = getattr(artifact, "device_mod", None)
+    if device_mod is not None and hasattr(device_mod, "inspect_source"):
+        inspected = device_mod.inspect_source()
+        if inspected:
+            return str(inspected)
+    raise AssertionError("lower(target='tile') did not produce inspectable MLIR source")
+
+
+@tilelang.testing.requires_package("mlir")
+def test_vmul_emits_linalg_mul():
+    artifact = tilelang.lower(_vmul_kernel(), target="tile")
+    mlir = _kernel_source(artifact)
+
+    assert "func.func" in mlir
+    assert "tilelang.scope" in mlir
+    assert "linalg.mul" in mlir
+
+
 if __name__ == "__main__":
-    program = vmul()
-    result = tilelang.lower(program, target="tile")
-    mlir_source = result.kernel_source
-    print(mlir_source)
-    # Check that the lowered MLIR contains the expected operations
-    assert mlir_source is not None and len(mlir_source) > 0, "Lowered MLIR output is empty"
-    assert "func.func" in mlir_source, "Missing func.func in lowered output"
-    assert "tilelang.scope" in mlir_source, "Missing tilelang.scope in lowered output"
-    assert "linalg.mul" in mlir_source, "Missing linalg.mul in lowered output"
-    print("All checks passed!")
+    tilelang.testing.main()

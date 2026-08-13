@@ -1,14 +1,22 @@
+"""TileLangIR ``tl.tileop.vreduce_max`` codegen tests."""
+
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
-def vreduce_max(M=1024, N=256, block_M=32):
+
+def _vreduce_max_kernel(
+    M: int = 1024,
+    N: int = 256,
+    block_M: int = 32,
+    dtype: str = "float32",
+):
     num_blocks = M // block_M
-    dtype = "float32"
 
     @T.prim_func
     def main(
-        A: T.Buffer((M, N), dtype),
-        C: T.Buffer((M,), dtype),
+        A: T.Tensor((M, N), dtype),
+        C: T.Tensor((M,), dtype),
     ):
         with T.Kernel(num_blocks) as bx:
             a_shared = T.alloc_shared((block_M, N), dtype)
@@ -32,12 +40,33 @@ def vreduce_max(M=1024, N=256, block_M=32):
 
     return main
 
+
+def _kernel_source(artifact) -> str:
+    source = getattr(artifact, "kernel_source", None)
+    if source:
+        return str(source)
+    device_mod = getattr(artifact, "device_mod", None)
+    if device_mod is not None and hasattr(device_mod, "inspect_source"):
+        inspected = device_mod.inspect_source()
+        if inspected:
+            return str(inspected)
+    raise AssertionError("lower(target='tile') did not produce inspectable MLIR source")
+
+
+@tilelang.testing.requires_package("mlir")
+def test_vreduce_max_emits_linalg_reduce():
+    artifact = tilelang.lower(_vreduce_max_kernel(), target="tile")
+    mlir = _kernel_source(artifact)
+
+    assert "func.func" in mlir
+    assert "linalg.reduce" in mlir
+    assert "linalg.fill" in mlir
+    assert "arith.maximumf" in mlir
+    # No tensor conversions should remain.
+    assert "bufferization.to_tensor" not in mlir
+    assert "tensor.generate" not in mlir
+    assert "materialize_in_destination" not in mlir
+
+
 if __name__ == "__main__":
-    program = vreduce_max()
-    result = tilelang.lower(program, target="tile")
-    mlir_source = result.kernel_source
-    print(mlir_source)
-    assert mlir_source is not None and len(mlir_source) > 0, "Lowered MLIR output is empty"
-    assert "func.func" in mlir_source, "Missing func.func in lowered output"
-    assert "linalg.reduce" in mlir_source, "Missing linalg.reduce in lowered output"
-    print("All checks passed!")
+    tilelang.testing.main()
