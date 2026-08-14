@@ -292,6 +292,25 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             offset = self._arith.AddIOp(offset, scaled_index).result
         return offset
 
+    def _is_identity_region_view(self, backing: Any, result_type: Any) -> bool:
+        """Return whether a region type describes the existing memref exactly."""
+
+        try:
+            backing_type = self._ir.MemRefType(backing.type)
+            region_type = self._ir.MemRefType(result_type)
+            backing_strides, backing_offset = backing_type.get_strides_and_offset()
+            region_strides, region_offset = region_type.get_strides_and_offset()
+        except (TypeError, ValueError):
+            return False
+
+        return (
+            tuple(backing_type.shape) == tuple(region_type.shape)
+            and backing_type.element_type == region_type.element_type
+            and backing_type.memory_space == region_type.memory_space
+            and tuple(backing_strides) == tuple(region_strides)
+            and backing_offset == region_offset
+        )
+
     def _emit_region(self, call: tirx.Call) -> Any:
         if len(call.args) < 3:
             raise ValueError("tl.tileop.region expects BufferLoad, access type, and extents")
@@ -352,6 +371,14 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             layout=layout,
             memory_space=self._memory_scope(buffer),
         )
+        if (
+            not dynamic_offsets
+            and not size_operands
+            and self._is_identity_region_view(backing, result_type)
+        ):
+            self._insert_value(call, backing)
+            return backing
+
         view_op = self._memref.ReinterpretCastOp(
             result_type,
             backing,
