@@ -1,9 +1,5 @@
 """Contract-validation checks for TODO 3 (artifact <-> .o binding checks).
 
-Mirrors the structure of ``tile_obj_launch_demo.py``: a module docstring,
-importable action-style ``check_*`` functions and a ``__main__`` dispatcher
-driven by command-line arguments.
-
 What is verified
 ----------------
 The bind-time checks added to ``tilelang/opentile/tile_obj.py``:
@@ -29,7 +25,9 @@ Workflow
 
        python examples/ascend/test_tile_obj_contract.py --list
 
-Run from the repo root with the project venv (``/home/wuyuchao/dev/.venv``).
+Shared helpers live in ``tile_obj_test_common.py``; the TODO 2 launch-time
+dtype checks live in ``test_tile_obj_dtype.py``.  Run from the repo root
+with the project venv (``/home/wuyuchao/dev/.venv``).
 """
 
 from __future__ import annotations
@@ -40,12 +38,7 @@ import sys
 import warnings
 from pathlib import Path
 
-# Make the repo importable even when tilelang is not an editable install.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from tilelang.opentile import tile_obj  # noqa: E402
+from tile_obj_test_common import _expect_raises, _info, run_module, tile_obj
 
 
 # ---------------------------------------------------------------------------
@@ -156,24 +149,6 @@ def _make_elf32(symbols, with_symtab=True):
         struct.pack_into("<I", blob, shoff + 80 + 24, 1)  # sh_link
         struct.pack_into("<I", blob, shoff + 80 + 36, 16)  # sh_entsize
     return bytes(blob)
-
-
-def _info(name, n_handles=3):
-    return tile_obj.LaunchInfo(
-        name=name,
-        arg_types=["handle"] * n_handles,
-        handle_shapes=[],
-        grid_exprs=[],
-        ubuf_expr=None,
-    )
-
-
-def _expect_raises(exc_type, fn, *args):
-    try:
-        fn(*args)
-    except exc_type:
-        return
-    raise AssertionError(f"expected {exc_type.__name__} but nothing was raised")
 
 
 # ---------------------------------------------------------------------------
@@ -347,42 +322,8 @@ def check_real_onboard_objects():
         check_real_onboard_object(p)
 
 
-# ---------------------------------------------------------------------------
-# Runner + CLI dispatcher
-# ---------------------------------------------------------------------------
-def _all_checks():
-    """Collect the zero-arg ``check_*`` functions to run in the default mode."""
-    return [
-        (name, fn) for name, fn in sorted(globals().items()) if name.startswith("check_") and callable(fn) and fn.__code__.co_argcount == 0
-    ]
-
-
-def list_checks():
-    print("Available checks:")
-    for name, _ in _all_checks():
-        print(f"  {name}")
-
-
-def run_all_checks():
-    """Run every zero-arg check; report PASS/FAIL and return the exit code."""
-    failed = 0
-    total = 0
-    for name, fn in _all_checks():
-        total += 1
-        try:
-            fn()
-            print(f"PASS  {name}")
-        except Exception as exc:  # runner reports any failure
-            failed += 1
-            print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
-    print(f"\n{total - failed}/{total} passed")
-    return 1 if failed else 0
-
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--list":
-        list_checks()
-    elif len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] != "--list":
         # Validate a specific hand-compiled object file.
         try:
             check_real_onboard_object(sys.argv[1])
@@ -390,5 +331,5 @@ if __name__ == "__main__":
         except Exception as exc:
             print(f"FAIL  check_real_onboard_object({sys.argv[1]}): {type(exc).__name__}: {exc}")
             sys.exit(1)
-    else:
-        sys.exit(run_all_checks())
+        sys.exit(0)
+    sys.exit(run_module(globals()))
