@@ -25,6 +25,7 @@ Notes / contract with the hand-compiled ``.o``:
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 import struct
 import warnings
@@ -77,6 +78,10 @@ class LaunchInfo:
     arg_types: list[str]
     # Per handle argument: the shape expressions of the corresponding buffer.
     handle_shapes: list[list[tirx.PrimExpr]]
+    # Per handle argument: the normalized dtype name of the corresponding
+    # buffer (e.g. "float16", "bfloat"); checked against tensor.dtype at
+    # launch time (TODO 2).
+    handle_dtypes: list[str]
     # Grid: one extent per blockIdx dimension; the launch grid is the product.
     grid_exprs: list[tirx.PrimExpr]
     # Dynamic UBUF bytes as a PrimExpr, or None when the kernel needs none.
@@ -182,16 +187,18 @@ def extract_launch_info(lowered_mod: Any, expect_name: str | None = None) -> Lau
     if main_func is None:
         main_func = funcs[0]
 
-    name = str(main_func.attrs["global_symbol"]) if "global_symbol" in main_func.attrs else str(list(lowered_mod.functions.keys())[0])
+    name = str(main_func.attrs["global_symbol"]) if "global_symbol" in main_func.attrs else str(list[Any](lowered_mod.functions.keys())[0])
 
-    # Argument types and per-handle shapes, in param order.
+    # Argument types and per-handle shapes/dtypes, in param order.
     arg_types: list[str] = []
     handle_shapes: list[list[tirx.PrimExpr]] = []
+    handle_dtypes: list[str] = []
     buffer_map = getattr(main_func, "buffer_map", {})
     for param in main_func.params:
         if param in buffer_map:
             arg_types.append("handle")
             handle_shapes.append([expr for expr in buffer_map[param].shape])
+            handle_dtypes.append(_dtype_name(buffer_map[param].dtype))
         else:
             kind = _SCALAR_DTYPE_TO_KIND.get(_dtype_name(param.dtype))
             if kind is None:
@@ -217,6 +224,7 @@ def extract_launch_info(lowered_mod: Any, expect_name: str | None = None) -> Lau
         name=name,
         arg_types=arg_types,
         handle_shapes=handle_shapes,
+        handle_dtypes=handle_dtypes,
         grid_exprs=grid_exprs,
         ubuf_expr=ubuf_expr,
     )
@@ -266,6 +274,99 @@ def _current_npu_stream() -> int:
         return int(BaseKernelAdapter.get_current_stream_functor()())
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Launch-time argument validation (TODO 2: wrong dtype must not fail silently)
+# ---------------------------------------------------------------------------
+
+# torch dtype names (after stripping the "torch." prefix) that differ from the
+# normalized tilelang dtype names.
+_TORCH_DTYPE_ALIASES = {"bfloat16": "bfloat"}
+
+# Inclusive value ranges for the integer arg kinds; values outside are
+# truncated by the C++ packer (static_cast) and would compute silently wrong.
+_INT_KIND_RANGES = {
+    "int8": (-(2**7), 2**7 - 1),
+    "uint8": (0, 2**8 - 1),
+    "int16": (-(2**15), 2**15 - 1),
+    "uint16": (0, 2**16 - 1),
+    "int32": (-(2**31), 2**31 - 1),
+    "uint32": (0, 2**32 - 1),
+    "int64": (-(2**63), 2**63 - 1),
+    "uint64": (0, 2**64 - 1),
+}
+
+
+def _dtype_family_bits(name: str) -> tuple[str, int]:
+    """Split a normalized dtype name into (family, bits); bits == 0 if unknown."""
+    match = re.match(r"^(u?int|float|bfloat)(\d+)?$", name)
+    if match is not None:
+        # A bare "bfloat" means bfloat16 in TVM/TIR naming.
+        return match.group(1), int(match.group(2)) if match.group(2) else 16
+    if name == "bool":
+        return "bool", 8
+    return name, 0
+
+
+def _check_handle_dtype(arg_index: int, torch_dtype: str, expected: str) -> None:
+    """Check one tensor's dtype against the IR buffer dtype.
+
+    ``torch_dtype`` is ``str(tensor.dtype)`` with the ``torch.`` prefix
+    stripped (e.g. "float16").  Same-width int/uint pairs are accepted: they
+    share the bit pattern, only the kernel-side interpretation differs.
+    Unknown expected dtypes downgrade to a warning (cannot verify reliably).
+    """
+    got = _TORCH_DTYPE_ALIASES.get(torch_dtype, torch_dtype)
+    if got == expected:
+        return
+    got_fb, expected_fb = _dtype_family_bits(got), _dtype_family_bits(expected)
+    if got_fb == expected_fb:
+        return
+    if {got_fb[0], expected_fb[0]} <= {"int", "uint"} and got_fb[1] == expected_fb[1] != 0:
+        return
+    if expected_fb[1] == 0:
+        warnings.warn(
+            f"argument {arg_index}: cannot verify tensor dtype `{torch_dtype}` against unknown IR buffer dtype `{expected}`",
+            stacklevel=3,
+        )
+        return
+    raise TypeError(
+        f"argument {arg_index} dtype mismatch: kernel expects `{expected}` but got "
+        f"`{torch_dtype}`; convert with tensor.to(...) -- the launch ABI passes a raw "
+        f"pointer, a wrong dtype computes silently wrong results"
+    )
+
+
+def _encode_scalar_arg(arg_index: int, kind: str, value: Any) -> int:
+    """Validate and encode one scalar kernel argument as int64.
+
+    Rejects type mismatches (e.g. float passed to an int kind) and values
+    outside the kind's range -- both would otherwise be silently truncated.
+    """
+    # Normalize numpy / torch scalar wrappers (they expose .item()).
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        value = value.item()
+    if kind in _INT_KIND_RANGES:
+        if not isinstance(value, int):
+            raise TypeError(
+                f"argument {arg_index} expects an int (`{kind}`), got {type(value).__name__} {value!r}; convert explicitly with int()"
+            )
+        low, high = _INT_KIND_RANGES[kind]
+        if not low <= value <= high:
+            raise ValueError(f"argument {arg_index} value {value} is out of range for `{kind}` [{low}, {high}]")
+        return value
+    if kind in ("float32", "float64"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"argument {arg_index} expects a float (`{kind}`), got {type(value).__name__} {value!r}")
+        as_float = float(value)
+        if kind == "float32":
+            packed = struct.unpack("<f", struct.pack("<f", as_float))[0]
+            if math.isfinite(as_float) and (math.isinf(packed) or math.isnan(packed)):
+                raise OverflowError(f"argument {arg_index} value {as_float!r} overflows the float32 range")
+            return struct.unpack("<i", struct.pack("<f", as_float))[0]
+        return struct.unpack("<q", struct.pack("<d", as_float))[0]
+    raise ValueError(f"unsupported arg kind `{kind}`")  # pragma: no cover - extract_launch_info rejects these
 
 
 class TileObjKernel:
@@ -329,11 +430,20 @@ class TileObjKernel:
     def _encode_args(self, args: list[Any]) -> list[int]:
         torch = _torch_module()
         encoded: list[int] = []
+        handle_index = 0
         for i, kind in enumerate(self.info.arg_types):
             value = args[i]
             if kind == "handle":
                 if not isinstance(value, torch.Tensor):
                     raise TypeError(f"argument {i} expects a torch.Tensor (handle), got {type(value)}")
+                # Dtype first (pairing correctness), then device/contiguity
+                # (runtime usability) -- a dtype mismatch computes silently
+                # wrong results even on a valid NPU tensor.
+                _check_handle_dtype(
+                    i,
+                    str(value.dtype).split(".")[-1],
+                    self.info.handle_dtypes[handle_index],
+                )
                 if value.device.type != "npu":
                     raise ValueError(
                         f"argument {i} is on {value.device}, expected an NPU tensor; the tile launch ABI passes a raw device pointer"
@@ -341,14 +451,9 @@ class TileObjKernel:
                 if not value.is_contiguous():
                     raise ValueError(f"argument {i} must be contiguous; the tile launch ABI passes a raw data pointer without strides")
                 encoded.append(int(value.data_ptr()))
-            elif kind in ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"):
-                encoded.append(int(value))
-            elif kind == "float32":
-                encoded.append(struct.unpack("<i", struct.pack("<f", float(value)))[0])
-            elif kind == "float64":
-                encoded.append(struct.unpack("<q", struct.pack("<d", float(value)))[0])
-            else:  # pragma: no cover - extract_launch_info rejects these
-                raise ValueError(f"unsupported arg kind `{kind}`")
+                handle_index += 1
+            else:
+                encoded.append(_encode_scalar_arg(i, kind, value))
         return encoded
 
     def __call__(self, *args: Any) -> None:
