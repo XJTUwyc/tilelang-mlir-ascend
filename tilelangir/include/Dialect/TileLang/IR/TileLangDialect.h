@@ -11,6 +11,7 @@
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/DialectImplementation.h"
 
 // TableGen-generated dialect declarations (TileLangDialect class skeleton).
 #include "TileLang/IR/TileLangDialect.h.inc"

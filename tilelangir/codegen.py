@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import tvm
 from tvm import IRModule
 from tvm.target import Target
-
-from tilelang import tvm
 
 from .translator import TileLangIRTranslator
 

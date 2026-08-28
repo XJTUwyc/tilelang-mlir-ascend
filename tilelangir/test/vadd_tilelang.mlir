@@ -50,7 +50,7 @@ module {
                 tilelang.copy %frag_C, %subview_C_1d : memref<64xf32, 2> to memref<64xf32, 1>
             }
         }
-    } {simd_attr = "simd"}
+    } {mode = #tilelang.scope_mode<simd>}
     tilelang.copy %C_shared, %C : memref<32x256xf32, 1> to memref<32x256xf32, 0>
     return
   }

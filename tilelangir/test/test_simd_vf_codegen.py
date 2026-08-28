@@ -1,4 +1,4 @@
-"""TileLangIR ``tilelang.scope`` codegen tests for ``T.SimdVF``."""
+"""TileLangIR execution-scope codegen tests for ``T.SimdVF``."""
 
 from __future__ import annotations
 
@@ -57,8 +57,7 @@ def test_simdvf_emits_tilelang_scope():
     mlir = _kernel_source(artifact)
     print(f"mlr:\n{mlir}")
     assert "tilelang.scope" in mlir
-    assert "simd_attr" in mlir
-    assert 'simd_attr = "simd"' in mlir
+    assert "mode = #tilelang.scope_mode<simd>" in mlir
     assert "tilelang.copy" in mlir
     assert "linalg.add" in mlir
 

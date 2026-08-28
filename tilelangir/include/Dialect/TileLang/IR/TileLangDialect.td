@@ -23,6 +23,7 @@ def TileLang_Dialect : Dialect {
     downstream compiler lowering. Their generic assembly form is the stable
     interchange format emitted by TileLang's Python code generator.
   }];
+  let useDefaultAttributePrinterParser = 1;
 }
 
 #endif // TILELANG_DIALECT_IR_TILELANGDIALECT_TD

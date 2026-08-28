@@ -147,12 +147,17 @@ LogicalResult ScopeOp::verify() {
     return emitOpError("body region's first block must not be empty");
   }
 
-  // simd_attr, if present, must be a non-empty string.
-  if (auto simdAttr = getSimdAttrAttr()) {
-    StringRef simdVal = simdAttr.getValue();
-    if (simdVal.empty()) {
-      return emitOpError("simd_attr must not be an empty string");
+  auto threads = getThreadsAttr();
+  if (getMode() == ScopeMode::SIMT) {
+    if (!threads) {
+      return emitOpError("SIMT mode requires threads");
     }
+    if (threads.getValue().isZero())
+      return emitOpError("threads must be greater than zero");
+    // TODO: Validate target-specific physical thread limits when the planned
+    // SIMT scheduling pass maps logical parallel work onto these workers.
+  } else if (threads) {
+    return emitOpError("threads is forbidden unless mode is SIMT");
   }
 
   return success();

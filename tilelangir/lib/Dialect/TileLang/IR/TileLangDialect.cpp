@@ -8,12 +8,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "TileLang/IR/TileLangDialect.h"
+#include "TileLang/IR/TileLangAttrs.h"
 #include "TileLang/IR/TileLangOps.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 using namespace tilelang;
 
 // TableGen-generated dialect definitions (e.g. TileLangDialect constructor).
+#include "TileLang/IR/TileLangAttrsEnums.cpp.inc"
 #include "TileLang/IR/TileLangDialect.cpp.inc"
 
 //===----------------------------------------------------------------------===//
@@ -21,8 +24,15 @@ using namespace tilelang;
 //===----------------------------------------------------------------------===//
 
 void TileLangDialect::initialize() {
+  addAttributes<
+#define GET_ATTRDEF_LIST
+#include "TileLang/IR/TileLangAttrs.cpp.inc"
+      >();
   addOperations<
 #define GET_OP_LIST
 #include "TileLang/IR/TileLangOps.cpp.inc"
       >();
 }
+
+#define GET_ATTRDEF_CLASSES
+#include "TileLang/IR/TileLangAttrs.cpp.inc"

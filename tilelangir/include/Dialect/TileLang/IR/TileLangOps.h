@@ -1,4 +1,5 @@
-//===- TileLangOps.h - TileLang operation declarations -----------*- C++ -*-===//
+//===- TileLangOps.h - TileLang operation declarations -----------*- C++
+//-*-===//
 //
 // This file declares TileLang operations. It includes the TableGen-generated
 // operation declarations (TileLangOps.h.inc) produced by mlir-tblgen from
@@ -9,6 +10,7 @@
 #ifndef TILELANG_IR_TILELANGOPS_H
 #define TILELANG_IR_TILELANGOPS_H
 
+#include "TileLang/IR/TileLangAttrs.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"

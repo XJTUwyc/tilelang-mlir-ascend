@@ -33,6 +33,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._math: Any = None
         self._memref: Any = None
         self._scf: Any = None
+        self._execution_scope_modes: list[str] = []
 
     def translate(self, source_module: IRModule) -> str:
         # 1. Check that the input is a tvm.IRModule
@@ -87,6 +88,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 self._math = None
                 self._memref = None
                 self._scf = None
+                self._execution_scope_modes.clear()
 
         return source
 
@@ -1053,8 +1055,15 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 if key not in saved_keys:
                     del self.value_map[key]
 
+    @contextmanager
+    def _execution_scope(self, mode: str) -> Generator[None, None, None]:
+        """Record the execution mode while translating a scope body."""
 
-
+        self._execution_scope_modes.append(mode)
+        try:
+            yield
+        finally:
+            self._execution_scope_modes.pop()
 
     #############
     # Overridden visitor methods
@@ -1066,30 +1075,55 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
     def visit_sblock_(self, op: tirx.SBlock) -> None:
         name = str(getattr(op, "name_hint", "") or "")
-        if name == "SimdVF":
-            self._emit_simdvf_scope(op)
+        annotations = getattr(op, "annotations", {})
+        mode_value = annotations.get("tl.execution_scope")
+        mode = str(mode_value) if mode_value is not None else None
+
+        # Keep accepting older SimdVF blocks while callers migrate to the
+        # explicit execution-scope annotation contract.
+        if mode is None and name == "SimdVF":
+            mode = "simd"
+
+        if mode is not None:
+            if mode not in ("simd", "simt"):
+                raise ValueError(
+                    "Unsupported TileLang execution scope mode "
+                    f"{mode!r} in block {name!r}."
+                )
+
+            threads = None
+            if mode == "simt":
+                raw_threads = annotations.get("tl.simt_threads")
+                if raw_threads is None:
+                    raise ValueError("A SIMT execution scope requires tl.simt_threads")
+                threads = self._static_int(raw_threads, "SIMT threads")
+                if not 1 <= threads <= (1 << 32) - 1:
+                    raise ValueError(
+                        "SIMT threads must be in the uint32 range [1, 4294967295]"
+                    )
+
+            scope_op = ScopeOp(mode=mode, threads=threads)
+            body_block = self._ir.Block.create_at_start(scope_op.body)
+            with (
+                self._ir.InsertionPoint(body_block),
+                self._scoped_value_map(),
+                self._execution_scope(mode),
+            ):
+                for buffer in op.alloc_buffers:
+                    self._emit_alloc_buffer(buffer)
+                self.visit_stmt(op.body)
             return
 
         for buffer in op.alloc_buffers:
             self._emit_alloc_buffer(buffer)
         self.visit_stmt(op.body)
 
-    def _emit_simdvf_scope(self, op: tirx.SBlock) -> None:
-        """Emit a ``tilelang.scope`` region for a ``T.SimdVF()`` SBlock.
-
-        The SBlock's alloc_buffers and body live in the scope's nested region.
-        Values created inside are scoped to that region and dropped from the
-        value_map afterwards, mirroring visit_for_: an SSA value defined in a
-        child region must not be referenced by the enclosing block.
-        """
-        scope_op = ScopeOp(simd_attr="simd")
-        body_block = self._ir.Block.create_at_start(scope_op.body)
-        with self._ir.InsertionPoint(body_block), self._scoped_value_map():
-            for buffer in op.alloc_buffers:
-                self._emit_alloc_buffer(buffer)
-            self.visit_stmt(op.body)
-
     def visit_for_(self, op: tirx.For) -> None:
+        parallel_rank = self._simt_parallel_rank(op)
+        if parallel_rank is not None:
+            self._emit_simt_forall(op, parallel_rank)
+            return
+
         index_type = self._ir.IndexType.get()
         lower = self._cast_to_index(self._get_or_create_expr_value(op.min))
         extent = self._cast_to_index(self._get_or_create_expr_value(op.extent))
@@ -1117,6 +1151,106 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         with self._ir.InsertionPoint(for_op.body):
             self.visit_stmt(op.body)
             self._scf.YieldOp([])
+        for key in list(self.value_map):
+            if key not in body_keys:
+                del self.value_map[key]
+
+    def _simt_parallel_rank(self, op: tirx.For) -> int | None:
+        """Infer the rank of a perfect SIMT parallel loop nest."""
+
+        if (
+            not self._execution_scope_modes
+            or self._execution_scope_modes[-1] != "simt"
+        ):
+            return None
+        if op.kind != tirx.ForKind.PARALLEL:
+            return None
+
+        # TIRX represents T.Parallel(X, Y, Z) as a perfect nest of parallel
+        # For nodes. During rapid bring-up, a directly nested sequence of
+        # one-dimensional T.Parallel calls has the same logical-thread meaning,
+        # so infer the domain structurally and avoid a frontend-only rank marker.
+        rank = 1
+        current = op
+        while True:
+            nested = self._unwrap_single_stmt(current.body)
+            if (
+                not isinstance(nested, tirx.For)
+                or nested.kind != tirx.ForKind.PARALLEL
+            ):
+                break
+            rank += 1
+            if rank > 3:
+                raise ValueError(
+                    "T.Parallel inside T.SimtVF currently supports one to three "
+                    f"logical thread dimensions, but received rank {rank}."
+                )
+            current = nested
+        return rank
+
+    @staticmethod
+    def _unwrap_single_stmt(stmt: Any) -> Any:
+        """Remove a one-element SeqStmt introduced by TIRX normalization."""
+
+        if isinstance(stmt, tirx.SeqStmt) and len(stmt.seq) == 1:
+            return stmt.seq[0]
+        return stmt
+
+    def _emit_simt_forall(self, outer: tirx.For, rank: int) -> None:
+        """Emit one target-neutral logical thread domain for ``T.Parallel``."""
+
+        loops: list[tirx.For] = []
+        current: Any = outer
+        for dimension in range(rank):
+            if (
+                not isinstance(current, tirx.For)
+                or current.kind != tirx.ForKind.PARALLEL
+            ):
+                raise ValueError(
+                    "Malformed SIMT parallel loop nest at logical dimension "
+                    f"{dimension}."
+                )
+            loops.append(current)
+            if dimension + 1 < rank:
+                current = self._unwrap_single_stmt(current.body)
+
+        logical_body = loops[-1].body
+        lower_bounds = []
+        upper_bounds = []
+        steps = []
+        index_type = self._ir.IndexType.get()
+        for loop in loops:
+            lower = self._cast_to_index(self._get_or_create_expr_value(loop.min))
+            extent = self._cast_to_index(
+                self._get_or_create_expr_value(loop.extent)
+            )
+            lower_bounds.append(lower)
+            upper_bounds.append(self._arith.AddIOp(lower, extent).result)
+            if loop.step is not None:
+                steps.append(
+                    self._cast_to_index(self._get_or_create_expr_value(loop.step))
+                )
+            else:
+                steps.append(
+                    self._arith.ConstantOp(
+                        index_type, self._ir.IntegerAttr.get(index_type, 1)
+                    ).result
+                )
+
+        forall_op = self._scf.ForallOp(lower_bounds, upper_bounds, steps)
+        forall_op.attributes["tilelang.loop_kind"] = self._ir.StringAttr.get(
+            "parallel"
+        )
+        forall_op.attributes["tilelang.logical_thread_axes"] = self._ir.ArrayAttr.get(
+            [self._ir.StringAttr.get(axis) for axis in ("x", "y", "z")[:rank]]
+        )
+
+        body_keys = set(self.value_map)
+        for loop, induction_variable in zip(loops, forall_op.induction_variables):
+            self._insert_value(loop.loop_var, induction_variable)
+        with self._ir.InsertionPoint(forall_op.body):
+            self.visit_stmt(logical_body)
+            self._scf.InParallelOp()
         for key in list(self.value_map):
             if key not in body_keys:
                 del self.value_map[key]
@@ -1325,7 +1459,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_infinity(op)
         elif op_name == "tl.tileop.vcvt":
             self._emit_vcvt(op)
-
     def _emit_fill(self, op: tirx.Call) -> None:
         if len(op.args) != 2:
             raise ValueError(f"tl.tileop.fill expects 2 arguments, but received {len(op.args)}")

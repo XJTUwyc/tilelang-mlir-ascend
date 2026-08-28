@@ -201,11 +201,13 @@ class GemmOp(_ods_ir.OpView):
 
 @_ods_cext.register_operation(_Dialect)
 class ScopeOp(_ods_ir.OpView):
-    """Scope region used for SimdVF and similar frontend scopes.
+    """Scope region with explicit default, SIMD, or SIMT execution mode.
 
     Assembly (unregistered dialect form)::
 
-        "tilelang.scope"() ({ ... }) {simd_attr = "simd"} : () -> ()
+        "tilelang.scope"() ({ ... }) {
+          mode = #tilelang.scope_mode<simt>, threads = 128 : ui32
+        } : () -> ()
     """
 
     OPERATION_NAME = "tilelang.scope"
@@ -215,13 +217,35 @@ class ScopeOp(_ods_ir.OpView):
     def __init__(
         self,
         *,
-        simd_attr: _Optional[str] = None,
+        mode: str,
+        threads: _Optional[int] = None,
         loc: _Optional[_ods_ir.Location] = None,
         ip: _Optional[_ods_ir.InsertionPoint] = None,
     ):
         attributes: dict = {}
-        if simd_attr is not None:
-            attributes["simd_attr"] = _ods_ir.StringAttr.get(simd_attr)
+        if mode not in ("default", "simd", "simt"):
+            raise ValueError(
+                "ScopeOp mode must be one of 'default', 'simd', or 'simt', "
+                f"got {mode!r}"
+            )
+        if mode == "simt" and threads is None:
+            raise ValueError("ScopeOp SIMT mode requires threads")
+        if mode != "simt" and threads is not None:
+            raise ValueError("ScopeOp threads are only valid in SIMT mode")
+        attributes["mode"] = _ods_ir.Attribute.parse(
+            f"#tilelang.scope_mode<{mode}>"
+        )
+        if threads is not None:
+            if isinstance(threads, bool) or not isinstance(threads, int):
+                raise TypeError("ScopeOp threads must be a uint32 integer")
+            if not 1 <= threads <= (1 << 32) - 1:
+                raise ValueError(
+                    "ScopeOp threads must be in the uint32 range "
+                    "[1, 4294967295]"
+                )
+            attributes["threads"] = _ods_ir.IntegerAttr.get(
+                _ods_ir.IntegerType.get_unsigned(32), threads
+            )
         super().__init__(
             self.OPERATION_NAME,
             self._ODS_REGIONS,
@@ -241,14 +265,44 @@ class ScopeOp(_ods_ir.OpView):
         return self.regions[0]
 
     @builtins.property
-    def simd_attr(self) -> _Optional[str]:
-        if "simd_attr" not in self.operation.attributes:
-            return None
-        return _ods_ir.StringAttr(self.operation.attributes["simd_attr"]).value
+    def mode(self):
+        return self.operation.attributes["mode"]
 
-    @simd_attr.setter
-    def simd_attr(self, value: _Optional[str]):
-        if value is not None:
-            self.operation.attributes["simd_attr"] = _ods_ir.StringAttr.get(value)
-        elif "simd_attr" in self.operation.attributes:
-            del self.operation.attributes["simd_attr"]
+    @builtins.property
+    def threads(self) -> _Optional[int]:
+        if "threads" not in self.operation.attributes:
+            return None
+        return _ods_ir.IntegerAttr(self.operation.attributes["threads"]).value
+
+
+# ===========================================================================
+# tilelang.scope_yield
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class ScopeYieldOp(_ods_ir.OpView):
+    """Terminator for ``tilelang.scope`` regions."""
+
+    OPERATION_NAME = "tilelang.scope_yield"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        *,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={},
+            results=[],
+            operands=[],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )

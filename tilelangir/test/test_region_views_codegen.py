@@ -62,7 +62,7 @@ def test_inner_loop_copy_emits_scf_for_and_squeezed_1d_view():
     assert "scf.for" in mlir
     assert mlir.count("scf.for") >= 2
     assert "tilelang.scope" in mlir
-    assert "simd_attr" in mlir
+    assert "mode = #tilelang.scope_mode<simd>" in mlir
     assert "tilelang.copy" in mlir
 
     # Golden-style squeeze: ``[1, VL]`` → ``memref<64xf32, ...>``, not ``1x64``.

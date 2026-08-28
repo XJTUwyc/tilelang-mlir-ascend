@@ -4,7 +4,7 @@
 # side-effects before any MLIR context is created.
 from . import _tilelang_ops_gen  # noqa: F401
 
-from ._tilelang_ops_gen import CopyOp, GemmOp, ScopeOp  # noqa: F401
+from ._tilelang_ops_gen import CopyOp, GemmOp, ScopeOp, ScopeYieldOp  # noqa: F401
 from .codegen import build_tilelang_ir, build_tilelang_ir_without_compile
 from .dialect import DIALECT_NAMESPACE, configure_context
 from .translator import TileLangIRTranslator
@@ -16,6 +16,7 @@ __all__ = [
     "CopyOp",
     "GemmOp",
     "ScopeOp",
+    "ScopeYieldOp",
     "DIALECT_NAMESPACE",
     "configure_context",
 ]

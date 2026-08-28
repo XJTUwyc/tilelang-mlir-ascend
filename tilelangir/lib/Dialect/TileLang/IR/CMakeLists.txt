@@ -9,6 +9,7 @@ add_mlir_dialect_library(TileLangDialect
 
   DEPENDS
   TileLangDialectIncGen
+  TileLangAttrsIncGen
   TileLangOpsIncGen
 
   LINK_LIBS PUBLIC

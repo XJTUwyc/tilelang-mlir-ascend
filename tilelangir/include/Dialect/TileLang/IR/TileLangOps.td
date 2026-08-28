@@ -6,17 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Keep this file synchronized with tilelangir/_tilelang_ops_gen.py. The Python
-// hand-written OpView classes are the codegen path; this TableGen file is the
-// downstream C++ dialect contract for the same operation names, operands,
-// regions, and attributes.
+// Keep this file synchronized with the matching repository copy.
+// TileLang's hand-written Python OpView classes follow the same operation,
+// region, and attribute contract.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef TILELANG_DIALECT_IR_TILELANGOPS_TD
 #define TILELANG_DIALECT_IR_TILELANGOPS_TD
 
-include "TileLangDialect.td"
+include "TileLang/IR/TileLangAttrs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -79,22 +78,26 @@ def TileLang_GemmOp : TileLang_Op<"gemm"> {
 
 // ---------------------------------------------------------------------------
 // tilelang.scope
-// Matches Python: ScopeOp(*, simd_attr=None) with body region
-// Generic form: "tilelang.scope"() ({ ... }) {simd_attr = "simd"} : () -> ()
+// Matches Python: ScopeOp(*, mode, threads=None) with body region
+// Generic form: "tilelang.scope"() ({ ... })
+//               {mode = #tilelang.scope_mode<simt>,
+//                threads = 128 : ui32}
+//               : () -> ()
 // ---------------------------------------------------------------------------
 def TileLang_ScopeOp : TileLang_Op<"scope", [NoTerminator]> {
-  let summary = "TileLang frontend scope (e.g. SimdVF)";
+  let summary = "TileLang frontend execution scope";
   let description = [{
-    `tilelang.scope` wraps a body region for a frontend scope such as SimdVF.
-    When `simd_attr` is set (for example to `"simd"`), it identifies the scope
-    kind for downstream lowering. The body region carries no terminator: the
-    Python translator emits it without a `tilelang.scope_yield`, so the
-    lowering to `npu.scope` must synthesize the `npu.yield` itself.
+    `tilelang.scope` wraps a body region for a frontend execution scope. The
+    required `mode` is one of `default`, `simd`, or `simt`.
 
-    Emitted by the TileLang Python translator for TIRX SBlocks named `SimdVF`.
+    In SIMT mode, `threads` is the requested physical worker count. Logical
+    work is represented independently by parallel loops inside the region.
   }];
 
-  let arguments = (ins OptionalAttr<StrAttr>:$simd_attr);
+  let arguments = (ins
+    TileLang_ScopeModeAttr:$mode,
+    OptionalAttr<UI32Attr>:$threads
+  );
   let regions = (region SizedRegion<1>:$body);
 
   let hasVerifier = 1;

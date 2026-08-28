@@ -26,7 +26,7 @@ from .loop import (
     Unroll,  # noqa: F401
     Vectorized,  # noqa: F401
 )
-from .scope import SimdVF  # noqa: F401
+from .scope import SimdVF, SimtVF  # noqa: F401
 from .simd import (  # noqa: F401
     vadd,
     vcvt,
