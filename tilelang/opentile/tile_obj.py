@@ -2,7 +2,7 @@
 
 Device compilation happens outside the repository: users hand-compile the
 MLIR/CCE kernel into a relocatable or executable CCE ELF (hereafter ``.o``)
-and pass the file path to :func:`compile_tile_obj`.
+and pass the file path to :func:`compile_tile_obj` or :func:`load_tile_obj`.
 
 This module implements the runtime half only:
 
@@ -13,10 +13,12 @@ This module implements the runtime half only:
    - the dynamic UBUF size (sum over ``shared.dyn`` allocations).
 2. :class:`TileObjKernel` evaluates grid/UBUF with the concrete tensor
    shapes, encodes arguments as int64, grabs the current NPU stream and
-   submits via the C++ entry point ``tl.tile.LaunchKernel``.
+   submits via the C++ entry point
+   ``tl.tile.LaunchKernelWithBinaryKind``.
 
 Notes / contract with the hand-compiled ``.o``:
-- The kernel symbol in the ``.o`` must equal the IR ``global_symbol``.
+- A single-core kernel symbol must equal the IR ``global_symbol``. A mixed
+  kernel may implement that entry as ``<name>_mix_aic``/``<name>_mix_aiv``.
 - The kernel argument list (order + types) must match the IR params.
 - ``grid_override`` / ``ubuf_override`` are escape hatches when the TIR
   expressions are too complex for the built-in evaluator.
@@ -38,7 +40,7 @@ from tvm import tirx
 if TYPE_CHECKING:
     pass
 
-__all__ = ["LaunchInfo", "TileObjKernel", "compile_tile_obj", "extract_launch_info"]
+__all__ = ["LaunchInfo", "TileObjKernel", "compile_tile_obj", "extract_launch_info", "load_tile_obj"]
 
 
 def _torch_module():
@@ -69,6 +71,25 @@ _SCALAR_DTYPE_TO_KIND = {
     "bool": "int32",
 }
 
+_BINARY_KIND_ALIASES = {
+    "auto": "auto",
+    "aiv": "aiv",
+    "vector": "aiv",
+    "aic": "aicore",
+    "aicore": "aicore",
+    "mix": "aicore",
+    "aicube": "aicube",
+    "cube": "aicube",
+}
+
+def _normalize_binary_kind(binary_kind: str) -> str:
+    if not isinstance(binary_kind, str):
+        raise TypeError(f"binary_kind must be a string, got {type(binary_kind).__name__}")
+    normalized = _BINARY_KIND_ALIASES.get(binary_kind.lower())
+    if normalized is None:
+        choices = ", ".join(sorted(_BINARY_KIND_ALIASES))
+        raise ValueError(f"unsupported binary_kind `{binary_kind}`; expected one of {choices}")
+    return normalized
 
 @dataclasses.dataclass
 class LaunchInfo:
@@ -86,6 +107,9 @@ class LaunchInfo:
     grid_exprs: list[tirx.PrimExpr]
     # Dynamic UBUF bytes as a PrimExpr, or None when the kernel needs none.
     ubuf_expr: tirx.PrimExpr | None
+    # Trailing i32 grid params (gridX, gridY, gridZ) injected when grid_dims
+    # is set; None otherwise.
+    trailing_grid_dims: tuple[int, int, int] | None = None
 
 
 def _dtype_name(dtype: Any) -> str:
@@ -378,15 +402,19 @@ class TileObjKernel:
         obj_bytes: bytes,
         grid_override: int | None = None,
         ubuf_override: int | None = None,
+        binary_kind: str = "auto",
     ):
         self.info = info
         self.obj_bytes = obj_bytes
         self.grid_override = grid_override
         self.ubuf_override = ubuf_override
-        self._launch = tvm.ffi.get_global_func("tl.tile.LaunchKernel")
+        self.binary_kind = _normalize_binary_kind(binary_kind)
+        self.trailing_grid_dims = tuple(info.trailing_grid_dims) if info.trailing_grid_dims else None
+        self._launch = tvm.ffi.get_global_func("tl.tile.LaunchKernelWithBinaryKind")
         if self._launch is None:
             raise RuntimeError(
-                "tl.tile.LaunchKernel is not registered; rebuild tilelang with src/tile enabled (see src/tile/CMakeLists.txt)"
+                "tl.tile.LaunchKernelWithBinaryKind is not registered; rebuild tilelang with src/tile enabled "
+                "(see src/tile/CMakeLists.txt)"
             )
 
     def _build_var_map(self, args: list[Any]) -> dict[str, int]:
@@ -457,15 +485,20 @@ class TileObjKernel:
         return encoded
 
     def __call__(self, *args: Any) -> None:
-        if len(args) != len(self.info.arg_types):
-            raise ValueError(f"kernel `{self.info.name}` expects {len(self.info.arg_types)} arguments but got {len(args)}")
+        trailing = list(self.trailing_grid_dims or ())
+        user_arg_count = len(self.info.arg_types) - len(trailing)
+        if len(args) != user_arg_count:
+            raise ValueError(
+                f"kernel `{self.info.name}` expects {user_arg_count} arguments "
+                f"({len(trailing)} trailing grid params are injected automatically) "
+                f"but got {len(args)}"
+            )
         arg_list = list(args)
         grid = self._compute_grid(arg_list)
         ubuf = self._compute_ubuf(arg_list)
         encoded = self._encode_args(arg_list)
         stream = _current_npu_stream()
-        self._launch(self.obj_bytes, self.info.name, grid, ubuf, stream, self.info.arg_types, encoded)
-
+        self._launch(self.obj_bytes, self.info.name, grid, ubuf, stream, self.info.arg_types, encoded, self.binary_kind)
 
 @dataclasses.dataclass
 class _ElfSymbol:
@@ -585,10 +618,22 @@ def _validate_symbol_table(info: LaunchInfo, obj_path: str | Path, obj_bytes: by
         raise ValueError(f"tile object `{obj_path}` has no symbol table (fully stripped?); cannot verify the kernel symbol contract.")
     sym = symbols.get(info.name)
     if sym is None:
+        mix_symbols = [symbols.get(f"{info.name}_mix_aic"), symbols.get(f"{info.name}_mix_aiv")]
+        if all(candidate is not None for candidate in mix_symbols):
+            for candidate in mix_symbols:
+                if candidate.st_type != _STT_FUNC:
+                    raise ValueError(
+                        f"mixed-core implementation `{candidate.name}` in  `{obj_path}` is not a function "
+                        f"(type={candidate.st_type})."
+                    )
+                if candidate.st_size == 0:
+                    raise ValueError(f"mixed-core implementaion `{candidate.name}` in `{obj_path}` has 0 size.")
+            return
         candidates = sorted(n for n, s in symbols.items() if s.st_type == _STT_FUNC and not n.startswith("."))
         raise ValueError(
             f"tile object `{obj_path}` has no symbol `{info.name}`; "
-            f"(expected kernel name = IR global_symbol). "
+            f"(expected kernel name = IR global_symbol, or a complete "
+            f"`{info.name}_mix_aic`/`{info.name}_mix_aiv` pair). "
             f"Available function symbols: {candidates or '(none)'}"
         )
     if sym.st_type != _STT_FUNC:
@@ -597,6 +642,52 @@ def _validate_symbol_table(info: LaunchInfo, obj_path: str | Path, obj_bytes: by
         )
     if sym.st_size == 0:
         raise ValueError(f"symbol `{info.name}` in `{obj_path}` has 0 size; the kernel has no code -- wrong .o?")
+
+def _resolve_mixed_runtime_entry(kernel_name: str, symbols: dict[str, _ElfSymbol]) -> tuple[str, bool]:
+    """Map a mixed-core ELF subtask name to its base runtime entry."""
+    for suffix, peer_suffix in (("_mix_aic", "_mix_aiv"), ("_mix_aiv", "_mix_aic")):
+        if kernel_name.endswith(suffix):
+            base = kernel_name[: -len(suffix)]
+            return (base, True) if f"{base}{peer_suffix}" in symbols else (kernel_name, False)
+    is_mix = f"{kernel_name}_mix_aic" in symbols and f"{kernel_name}_mix_aiv" in symbols
+    return kernel_name, is_mix
+
+
+def _infer_binary_kind(
+    kernel_name: str,
+    symbols: dict[str, _ElfSymbol],
+) -> str | None:
+    """Infer the ACL binary kind from Ascend ELF metadata symbols."""
+    has_mix = (
+        "__CCE_Mix_Kernel_Policy" in symbols
+        or f".Mix_Kernel_Type_{kernel_name}" in symbols
+        or (
+            f"{kernel_name}_mix_aic" in symbols
+            and f"{kernel_name}_mix_aiv" in symbols
+        )
+    )
+    if has_mix:
+        # ACL loads MIX kernels through the AICORE binary magic.
+        return "aicore"
+
+    if f".AIV_Kernel_Type_{kernel_name}" in symbols:
+        return "aiv"
+
+    return None
+
+
+def _resolve_binary_kind(
+    requested: str,
+    kernel_name: str,
+    symbols: dict[str, _ElfSymbol],
+) -> str:
+    """Honor an explicit kind, otherwise infer it from ELF metadata."""
+    requested = _normalize_binary_kind(requested)
+    if requested != "auto":
+        return requested
+
+    inferred = _infer_binary_kind(kernel_name, symbols)
+    return inferred if inferred is not None else "auto"
 
 
 def _check_dwarf_signature(info: LaunchInfo, obj_bytes: bytes) -> tuple[str, str | None]:
@@ -667,6 +758,7 @@ def compile_tile_obj(
     obj_path: str | Path,
     grid_override: int | None = None,
     ubuf_override: int | None = None,
+    binary_kind: str = "auto",
 ) -> TileObjKernel:
     """Bind a hand-compiled object to TileLang kernel metadata.
 
@@ -687,6 +779,10 @@ def compile_tile_obj(
         Skip TIR grid extraction and always launch with this block count.
     ubuf_override : int, optional
         Skip TIR UBUF extraction and always pass this dynamic UBUF size.
+    binary_kind : str, optional
+        ACL object kind. Use ``"aiv"`` for vector-only objects and
+        ``"aicore"`` for generic or mixed AIC/AIV objects. ``"auto"`` keeps
+        the ACL default behavior.
     """
     # No top-level torch import here: compile_tile_obj only inspects already
     # lowered artifacts/modules, so it must not pull in tilelang.engine.param
@@ -713,5 +809,97 @@ def compile_tile_obj(
 
     info = extract_launch_info(lowered_mod, expect_name=expect_name)
     obj_bytes = Path(obj_path).read_bytes()
+    try:
+        symbols = _read_elf_symbols(obj_bytes)
+    except Exception as exc:
+        raise ValueError(f"tile object `{obj_path}` is not a readable ELF: {exc}") from exc
+    normalized_binary_kind = _resolve_binary_kind(binary_kind, info.name, symbols)
     _validate_tile_obj(info, obj_path, obj_bytes)
-    return TileObjKernel(info, obj_bytes, grid_override=grid_override, ubuf_override=ubuf_override)
+    return TileObjKernel(
+        info,
+        obj_bytes,
+        grid_override=grid_override,
+        ubuf_override=ubuf_override,
+        binary_kind=normalized_binary_kind,
+    )
+
+def load_tile_obj(
+    obj_path: str | Path,
+    kernel_name: str,
+    arg_types: list[str] | tuple[str, ...],
+    grid: int,
+    ubuf_size: int = 0,
+    binary_kind: str = "auto",
+    handle_dtypes: list[str] | tuple[str, ...] | None = None,
+    grid_dims: tuple[int, int, int] | None = None,
+) -> TileObjKernel:
+    """Bind a raw CCE object using an explicit launch manifest.
+
+    Unlike :func:`compile_tile_obj`, this entry point does not require a
+    lowered TileLang artifact. Kernel name, argument ABI, grid, dynamic UBUF,
+    and binary kind must come from a trusted manifest such as onboard's
+    ``runner.json``; they cannot be recovered reliably from a stripped ``.o``.
+    ``handle_dtypes`` should list one dtype per ``handle`` argument; omitted
+    dtypes are treated as unknown and only produce a launch-time warning.
+    ``grid_dims``, when given as ``(gridX, gridY, gridZ)`` appends three
+    trailing i32 grid arguments to the device ABI —— the shape OpenTile/Triton
+    kernels expect from the inject-grid-params pass.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name:
+        raise ValueError("kernel_name must be a non-empty string")
+    if not isinstance(grid, int) or grid <= 0:
+        raise ValueError(f"grid must be a positive integer, got {grid}")
+    if not isinstance(ubuf_size, int) or ubuf_size < 0:
+        raise ValueError(f"ubuf_size must be a non-negative integer, got {ubuf_size}")
+
+    if grid_dims is not None:
+        grid_dims = tuple(int(d) for d in grid_dims)
+        if len(grid_dims) != 3 or any(d <= 0 for d in grid_dims):
+            raise ValueError(f"grid_dims must be three positive ints (gridX, gridY, gridZ), got {grid_dims}")
+
+    arg_types = list(arg_types)
+    supported = {"handle", *_SCALAR_DTYPE_TO_KIND.values()}
+    unsupported = [kind for kind in arg_types if kind not in supported]
+    if unsupported:
+        raise ValueError(f"unsupported tile object argument type(s): {unsupported}")
+    handle_count = arg_types.count("handle")
+    if handle_dtypes is None:
+        handle_dtypes = ["unknown"] * handle_count
+    else:
+        handle_dtypes = [_dtype_name(dtype) for dtype in handle_dtypes]
+        if len(handle_dtypes) != handle_count:
+            raise ValueError(f"handle_dtypes has {len(handle_dtypes)} entries but arg_types contains {handle_count} handles")
+
+    if grid_dims is not None:
+        arg_types.extend(["int32", "int32", "int32"])
+
+    obj_bytes = Path(obj_path).read_bytes()
+    try:
+        symbols = _read_elf_symbols(obj_bytes)
+    except Exception as exc:
+        raise ValueError(f"tile object `{obj_path}` is not a readable ELF: {exc}") from exc
+    runtime_name, _ = _resolve_mixed_runtime_entry(kernel_name, symbols)
+    if runtime_name != kernel_name:
+        warnings.warn(
+            f"`{kernel_name}` is a mixed-core ELF subtask; using base runtime entry `{runtime_name}`",
+            stacklevel=2,
+        )
+    normalized_binary_kind = _resolve_binary_kind(binary_kind, runtime_name, symbols)
+
+    info = LaunchInfo(
+        name=runtime_name,
+        arg_types=arg_types,
+        handle_shapes=[[] for kind in arg_types if kind == "handle"],
+        handle_dtypes=handle_dtypes,
+        grid_exprs=[],
+        ubuf_expr=None,
+        trailing_grid_dims=grid_dims,
+    )
+    _validate_tile_obj(info, obj_path, obj_bytes)
+    return TileObjKernel(
+        info,
+        obj_bytes,
+        grid_override=grid,
+        ubuf_override=ubuf_size,
+        binary_kind=normalized_binary_kind,
+    )

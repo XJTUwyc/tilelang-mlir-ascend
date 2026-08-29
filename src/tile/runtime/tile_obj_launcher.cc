@@ -16,8 +16,10 @@
  *   4. Submit with aclrtLaunchKernelWithHostArgs.  The grid (logical core
  *      count) and dynamic UBUF size are computed by the Python side.
  *
- * Python-side entry point: tl.tile.LaunchKernel(o_bytes, kernel_name, grid,
- *     ubuf_size, stream, arg_types, args)
+ * Python-side entry points:
+ *   - tl.tile.LaunchKernel(..., args) uses ACL's automatic binary kind.
+ *   - tl.tile.LaunchKernelWithBinaryKind(..., args, binary_kind) selects the
+ *     AIV/AIC/mixed ELF magic explicitly.
  *
  *   - arg_types[i] is one of:
  *       "handle", "int8", "int16", "int32", "int64",
@@ -58,11 +60,33 @@ using AclFuncHandle = void *;
 using AclStream = void *;
 
 constexpr AclError kAclSuccess = 0;
+constexpr int32_t kAclBinaryLoadOptMagic = 2;
+constexpr uint32_t kAclBinaryMagicElfAiCore = 0x43554245U;
+constexpr uint32_t kAclBinaryMagicElfVectorCore = 0x41415246U;
+constexpr uint32_t kAclBinaryMagicElfCubeCore = 0x41494343U;
 constexpr int32_t kAclLaunchKernelAttrDynUbufSize = 2;
 // Mirrors tilelang-ascend-cce's runtime: every scalar kernel argument is
 // aligned to at least 4 bytes, and the whole packed buffer to 8 bytes.
 constexpr size_t kAclArgMinAlignment = 4;
 constexpr size_t kAclArgBufferAlignment = 8;
+
+uint32_t ParseBinaryMagic(const std::string &binary_kind) {
+  if (binary_kind == "auto") return 0;
+  if (binary_kind == "aiv" || binary_kind == "vector") {
+    return kAclBinaryMagicElfVectorCore;
+  }
+  if (binary_kind == "aic" || binary_kind == "aicore" ||
+      binary_kind == "mix") {
+    return kAclBinaryMagicElfAiCore;
+  }
+  if (binary_kind == "aicube" || binary_kind == "cube") {
+    return kAclBinaryMagicElfCubeCore;
+  }
+  TVM_FFI_THROW(ValueError)
+      << "Unsupported Tile binary kind `" << binary_kind
+      << "`; expected auto, aiv, aic, aicore, mix, aicube, or cube";
+  TVM_FFI_UNREACHABLE();
+}
 
 size_t AlignUp(size_t value, size_t alignment) {
   TVM_FFI_ICHECK_NE(alignment, 0U);
@@ -276,6 +300,25 @@ struct AclLaunchKernelCfg {
   size_t num_attrs;
 };
 
+// Local mirrors of the public ACL binary-load option ABI.  Keeping these
+// declarations here preservers the runtime's no-CANN-header build contract.
+union AclBinaryLoadOptionValue {
+  uint32_t is_lazy_load;
+  uint32_t magic;
+  int32_t cpu_kernel_mode;
+  uint32_t reserved[4];
+};
+
+struct AclBinaryLoadOption {
+  int32_t type;
+  AclBinaryLoadOptionValue value;
+};
+
+struct AclBinaryLoadOptions {
+  AclBinaryLoadOption *options;
+  size_t num_options;
+};
+
 class TileDriver {
 public:
   static TileDriver *Global() {
@@ -284,8 +327,16 @@ public:
   }
 
   AclError BinaryLoadFromData(const void *data, size_t size,
+                              uint32_t binary_magic,
                               AclBinHandle *handle) const {
-    return binary_load_from_data_(data, size, nullptr, handle);
+    if (binary_magic == 0) {
+      return binary_load_from_data_(data, size, nullptr, handle);
+    }
+    AclBinaryLoadOption option{};
+    option.type = kAclBinaryLoadOptMagic;
+    option.value.magic = binary_magic;
+    AclBinaryLoadOptions options{&option, 1};
+    return binary_load_from_data_(data, size, &options, handle);
   }
 
   AclError BinaryGetFunction(AclBinHandle binary, const char *name,
@@ -378,18 +429,18 @@ public:
   // symbol.  Handles are cached for the process lifetime; the OS reclaims
   // them at exit (matches the Ascend backend's driver handles).
   AclFuncHandle GetFunction(const std::string &obj_bytes,
-                            const std::string &kernel_name,
-                            int32_t device_id) {
+                            const std::string &kernel_name, int32_t device_id,
+                            uint32_t binary_magic) {
     std::lock_guard<std::mutex> lock(mutex_);
     TileDriver *driver = TileDriver::Global();
     // Key on the object *contents* rather than a std::hash digest: hashing
     // would let two different objects with colliding digests share one
     // device binary, silently launching the wrong kernel.
-    BinaryKey key{obj_bytes, device_id};
+    BinaryKey key{obj_bytes, device_id, binary_magic};
     AclBinHandle &binary = binaries_[key];
     if (binary == nullptr) {
       CheckAcl(driver->BinaryLoadFromData(obj_bytes.data(), obj_bytes.size(),
-                                          &binary),
+                                          binary_magic, &binary),
                "aclrtBinaryLoadFromData");
     }
     FuncKey fkey{binary, kernel_name};
@@ -419,14 +470,26 @@ public:
   }
 
 private:
-  using BinaryKey = std::pair<std::string, int32_t>;
+  struct BinaryKey {
+    std::string obj_bytes;
+    int32_t device_id;
+    uint32_t binary_magic;
+
+    bool operator==(const BinaryKey &other) const {
+      return obj_bytes == other.obj_bytes &&device_id == other.device_id &&
+             binary_magic == other.binary_magic;
+    }
+  };
+
   using FuncKey = std::pair<AclBinHandle, std::string>;
   using PlanKey = std::pair<AclFuncHandle, std::string>;
 
   struct BinaryKeyHash {
     size_t operator()(const BinaryKey &key) const {
-      return std::hash<std::string>{}(key.first) ^
-             (std::hash<int32_t>{}(key.second) << 1);
+      size_t hash = std::hash<std::string>{}(key.obj_bytes);
+      hash ^= std::hash<int32_t>{}(key.device_id) << 1;
+      hash ^= std::hash<uint32_t>{}(key.binary_magic) << 2;
+      return hash;
     }
   };
 
@@ -475,7 +538,7 @@ AclError LaunchPacked(TileDriver *driver, AclFuncHandle function,
 void LaunchKernelImpl(ffi::Bytes o_bytes, ffi::String kernel_name, int64_t grid,
                       int64_t ubuf_size, uint64_t stream,
                       ffi::Array<ffi::String> arg_types,
-                      ffi::Array<int64_t> args) {
+                      ffi::Array<int64_t> args, ffi::String binary_kind) {
   TVM_FFI_ICHECK(grid > 0)
       << "Tile launch grid must be positive, got " << grid;
   TVM_FFI_ICHECK(grid <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
@@ -492,8 +555,11 @@ void LaunchKernelImpl(ffi::Bytes o_bytes, ffi::String kernel_name, int64_t grid,
   int32_t device_id = 0;
   CheckAcl(driver->GetDevice(&device_id), "aclrtGetDevice");
   std::string symbol = kernel_name.operator std::string();
+  uint32_t binary_magic =
+      ParseBinaryMagic(binary_kind.operator std::string());
   AclFuncHandle function = BinaryRegistry::Global()->GetFunction(
-      std::string(o_bytes.data(), o_bytes.size()), symbol, device_id);
+      std::string(o_bytes.data(), o_bytes.size()), symbol, device_id,
+      binary_magic);
 
   // The pack layout depends only on arg_types: cache it per function so
   // repeated launches neither re-parse nor re-allocate.
@@ -550,9 +616,19 @@ void LaunchKernelImpl(ffi::Bytes o_bytes, ffi::String kernel_name, int64_t grid,
   }
 }
 
+void LaunchKernelAutoImpl(ffi::Bytes o_bytes, ffi::String kernel_name,
+                          int64_t grid, int64_t ubuf_size, uint64_t stream,
+                          ffi::Array<ffi::String> arg_types,
+                          ffi::Array<int64_t> args) {
+  LaunchKernelImpl(o_bytes, kernel_name, grid, ubuf_size, stream, arg_types,
+                   args, ffi::String("auto"));
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.tile.LaunchKernel", &LaunchKernelImpl);
+  refl::GlobalDef()
+      .def("tl.tile.LaunchKernel", &LaunchKernelAutoImpl)
+      .def("tl.tile.LaunchKernelWithBinaryKind", &LaunchKernelImpl);
 }
 
 } // namespace
