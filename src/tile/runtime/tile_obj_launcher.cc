@@ -433,9 +433,12 @@ public:
                             uint32_t binary_magic) {
     std::lock_guard<std::mutex> lock(mutex_);
     TileDriver *driver = TileDriver::Global();
-    // Key on the object *contents* rather than a std::hash digest: hashing
-    // would let two different objects with colliding digests share one
-    // device binary, silently launching the wrong kernel.
+    // Keep the full object contents in the in-process cache key.
+    // BinaryKeyHash is used only for unordered_map bucket selection;
+    // BinaryKey::operator== still compares the complete object bytes,
+    // device id, and binary magic, so hash collisions cannot alias handles.
+    // A future persistent or cross-language cache must define a separate,
+    // versioned and stable digest/key schema.
     BinaryKey key{obj_bytes, device_id, binary_magic};
     AclBinHandle &binary = binaries_[key];
     if (binary == nullptr) {

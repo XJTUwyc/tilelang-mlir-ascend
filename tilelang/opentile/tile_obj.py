@@ -10,24 +10,24 @@ This module implements the runtime half only:
    - the kernel name (``global_symbol``),
    - the argument types (buffer params -> "handle", scalars -> dtype),
    - the launch grid expression (``thread_extent`` / ``blockIdx.x``),
-   - the dynamic UBUF size (sum over ``shared.dyn`` allocations).
-2. :class:`TileObjKernel` evaluates grid/UBUF with the concrete tensor
-   shapes, encodes arguments as int64, grabs the current NPU stream and
-   submits via the C++ entry point
-   ``tl.tile.LaunchKernelWithBinaryKind``.
+2. :class:`TileObjKernel` evaluates the launch grid with concrete tensor
+   shapes, passes an optional additional dynamic UBUF size, encodes arguments,
+   and submits through ``tl.tile.LaunchKernelWithBinaryKind``.
 
 Notes / contract with the hand-compiled ``.o``:
-- A single-core kernel symbol must equal the IR ``global_symbol``. A mixed
-  kernel may implement that entry as ``<name>_mix_aic``/``<name>_mix_aiv``.
+- A single-core kernel symbol must equal the IR ``global_symbol``.
+- For a mixed kernel, the caller must provide the base runtime entry name
+  rather than an individual ``_mix_aic`` or ``_mix_aiv`` symbol.
 - The kernel argument list (order + types) must match the IR params.
-- ``grid_override`` / ``ubuf_override`` are escape hatches when the TIR
-  expressions are too complex for the built-in evaluator.
+- ``grid_override`` overrides the grid extracted from TIR.
+- ``ubuf_override`` is the additional dynamic UBUF size passed at launch.
+  Compiler-allocated static UB comes from the object metadata; CANN Runtime
+  combines the static and dynamic portions.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import math
 import re
 import struct
 import warnings
@@ -91,6 +91,15 @@ def _normalize_binary_kind(binary_kind: str) -> str:
         raise ValueError(f"unsupported binary_kind `{binary_kind}`; expected one of {choices}")
     return normalized
 
+@dataclasses.dataclass(frozen=True)
+class DynamicSymbolSource:
+    """Runtime source of a dynamic TIR variable."""
+
+    kind: str   # "scalar", "shape", "stride"
+    param_index: int
+    dim_index: int = -1
+    scale: int = 1
+
 @dataclasses.dataclass
 class LaunchInfo:
     """Metadata extracted from the lowered TIR of a Tile kernel."""
@@ -105,12 +114,22 @@ class LaunchInfo:
     handle_dtypes: list[str]
     # Grid: one extent per blockIdx dimension; the launch grid is the product.
     grid_exprs: list[tirx.PrimExpr]
-    # Dynamic UBUF bytes as a PrimExpr, or None when the kernel needs none.
-    ubuf_expr: tirx.PrimExpr | None
+    #Runtime sources used to resolve dynamic variables in grid expressions.
+    dynamic_symbol_sources: dict[str, list[DynamicSymbolSource]] = (
+        dataclasses.field(default_factory=dict)
+    )
     # Trailing i32 grid params (gridX, gridY, gridZ) injected when grid_dims
     # is set; None otherwise.
     trailing_grid_dims: tuple[int, int, int] | None = None
 
+def _add_dynamic_symbol_source(
+        sources: dict[str, list[DynamicSymbolSource]],
+        var: tirx.Var,
+        source: DynamicSymbolSource,
+) -> None:
+    candidates = sources.setdefault(var.name, [])
+    if source not in candidates:
+        candidates.append(source)
 
 def _dtype_name(dtype: Any) -> str:
     text = str(dtype)
@@ -125,14 +144,6 @@ def _dtype_name(dtype: Any) -> str:
     return text
 
 
-def _buffer_bytes(dtype: Any) -> int:
-    text = _dtype_name(dtype)
-    match = re.search(r"(\d+)", text)
-    if match is None:
-        return 1
-    return max(1, int(match.group(1)) // 8)
-
-
 def _iter_stmt_fields(node: Any):
     """Yield the child statements of common tirx statement nodes."""
     # SBlockRealize wraps its SBlock in `block` (not `body`); SBlock has both
@@ -143,13 +154,12 @@ def _iter_stmt_fields(node: Any):
             yield child
 
 
-def _collect_grid_ubuf(
+def _collect_grid(
     stmt: Any,
     grid_exprs: list[tirx.PrimExpr],
-    ubuf_terms: list[tirx.PrimExpr],
     seen: set[int],
 ) -> None:
-    """Walk the statement tree collecting blockIdx extents and shared.dyn sizes."""
+    """Walk the statement tree and collect blockIdx extents."""
     if id(stmt) in seen:
         return
     seen.add(id(stmt))
@@ -159,26 +169,9 @@ def _collect_grid_ubuf(
         tag = getattr(iter_var, "thread_tag", "")
         if str(tag).startswith("blockIdx"):
             grid_exprs.append(stmt.value)
-    elif isinstance(stmt, tirx.AllocBuffer):
-        buffer = stmt.buffer
-        if "shared.dyn" in str(buffer.scope()):
-            size = tirx.IntImm("int64", 1)
-            for extent in buffer.shape:
-                size = tirx.Mul(size, tirx.Cast("int64", extent))
-            ubuf_terms.append(tirx.Mul(size, tirx.IntImm("int64", _buffer_bytes(buffer.dtype))))
-    elif isinstance(stmt, tirx.SBlock):
-        # In tile lowered IR the shared allocations live on the SBlock's
-        # alloc_buffers list (sblock_alloc_buffer), not as AllocBuffer
-        # statements.  The AllocBuffer branch above is kept as a fallback.
-        for buffer in stmt.alloc_buffers or []:
-            if "shared.dyn" in str(buffer.scope()):
-                size = tirx.IntImm("int64", 1)
-                for extent in buffer.shape:
-                    size = tirx.Mul(size, tirx.Cast("int64", extent))
-                ubuf_terms.append(tirx.Mul(size, tirx.IntImm("int64", _buffer_bytes(buffer.dtype))))
 
     for child in _iter_stmt_fields(stmt):
-        _collect_grid_ubuf(child, grid_exprs, ubuf_terms, seen)
+        _collect_grid(child, grid_exprs, seen)
 
 
 def extract_launch_info(lowered_mod: Any, expect_name: str | None = None) -> LaunchInfo:
@@ -217,32 +210,72 @@ def extract_launch_info(lowered_mod: Any, expect_name: str | None = None) -> Lau
     arg_types: list[str] = []
     handle_shapes: list[list[tirx.PrimExpr]] = []
     handle_dtypes: list[str] = []
+    dynamic_symbol_sources: dict[str, list[DynamicSymbolSource]] = {}
+
     buffer_map = getattr(main_func, "buffer_map", {})
-    for param in main_func.params:
+
+    for param_index, param in enumerate(main_func.params):
         if param in buffer_map:
+            buffer = buffer_map[param]
+
             arg_types.append("handle")
-            handle_shapes.append([expr for expr in buffer_map[param].shape])
-            handle_dtypes.append(_dtype_name(buffer_map[param].dtype))
+            handle_shapes.append(list(buffer.shape))
+            handle_dtypes.append(_dtype_name(buffer.dtype))
+
+            for dim_index, shape in enumerate(buffer.shape):
+                if isinstance(shape, tirx.Var):
+                    _add_dynamic_symbol_source(
+                        dynamic_symbol_sources,
+                        shape,
+                        DynamicSymbolSource(
+                            kind="shape",
+                            param_index=param_index,
+                            dim_index=dim_index,
+                        ),
+                    )
+
+            for dim_index, stride in enumerate(buffer.strides or []):
+                if not isinstance(stride, tirx.Var):
+                    continue
+
+                element_bits = buffer.dtype.bits * buffer.dtype.lanes
+                stride_scale = 8 // element_bits if element_bits < 8 else 1
+
+                _add_dynamic_symbol_source(
+                    dynamic_symbol_sources,
+                    stride,
+                    DynamicSymbolSource(
+                        kind="stride",
+                        param_index=param_index,
+                        dim_index=dim_index,
+                        scale=stride_scale,
+                    ),
+                )
         else:
             kind = _SCALAR_DTYPE_TO_KIND.get(_dtype_name(param.dtype))
             if kind is None:
-                raise ValueError(f"extract_launch_info: unsupported scalar dtype `{param.dtype}` for parameter `{param}`")
+                raise ValueError(
+                    "extract_launch_info: unsupported scalar dtype "
+                    f"`{param.dtype}` for parameter `{param}`"
+                )
+
             arg_types.append(kind)
-            # Scalars do not occupy a handle_shapes slot: handle_shapes is
-            # indexed by the handle counter, not by the parameter index.
+
+            if isinstance(param, tirx.Var):
+                _add_dynamic_symbol_source(
+                    dynamic_symbol_sources,
+                    param,
+                    DynamicSymbolSource(
+                        kind="scalar",
+                        param_index=param_index,
+                    ),
+                )
 
     grid_exprs: list[tirx.PrimExpr] = []
-    ubuf_terms: list[tirx.PrimExpr] = []
-    _collect_grid_ubuf(main_func.body, grid_exprs, ubuf_terms, set())
+    _collect_grid(main_func.body, grid_exprs, set())
 
     if not grid_exprs:
         raise ValueError("extract_launch_info: no blockIdx thread_extent found; is this a T.Kernel function lowered with target='tile'?")
-
-    ubuf_expr: tirx.PrimExpr | None = None
-    if ubuf_terms:
-        ubuf_expr = ubuf_terms[0]
-        for term in ubuf_terms[1:]:
-            ubuf_expr = tirx.Add(ubuf_expr, term)
 
     return LaunchInfo(
         name=name,
@@ -250,7 +283,7 @@ def extract_launch_info(lowered_mod: Any, expect_name: str | None = None) -> Lau
         handle_shapes=handle_shapes,
         handle_dtypes=handle_dtypes,
         grid_exprs=grid_exprs,
-        ubuf_expr=ubuf_expr,
+        dynamic_symbol_sources=dynamic_symbol_sources,
     )
 
 
@@ -308,29 +341,23 @@ def _current_npu_stream() -> int:
 # normalized tilelang dtype names.
 _TORCH_DTYPE_ALIASES = {"bfloat16": "bfloat"}
 
-# Inclusive value ranges for the integer arg kinds; values outside are
-# truncated by the C++ packer (static_cast) and would compute silently wrong.
-_INT_KIND_RANGES = {
-    "int8": (-(2**7), 2**7 - 1),
-    "uint8": (0, 2**8 - 1),
-    "int16": (-(2**15), 2**15 - 1),
-    "uint16": (0, 2**16 - 1),
-    "int32": (-(2**31), 2**31 - 1),
-    "uint32": (0, 2**32 - 1),
-    "int64": (-(2**63), 2**63 - 1),
-    "uint64": (0, 2**64 - 1),
-}
-
 
 def _dtype_family_bits(name: str) -> tuple[str, int]:
-    """Split a normalized dtype name into (family, bits); bits == 0 if unknown."""
-    match = re.match(r"^(u?int|float|bfloat)(\d+)?$", name)
-    if match is not None:
-        # A bare "bfloat" means bfloat16 in TVM/TIR naming.
-        return match.group(1), int(match.group(2)) if match.group(2) else 16
-    if name == "bool":
-        return "bool", 8
-    return name, 0
+    """Return the TVM dtype family and per-lane bit width."""
+    try:
+        dtype = tvm.DataType(name)
+    except ValueError:
+        return name, 0
+
+    families = {
+        tvm.DataTypeCode.INT: "int",
+        tvm.DataTypeCode.UINT: "uint",
+        tvm.DataTypeCode.FLOAT: "float",
+        tvm.DataTypeCode.BFLOAT: "bfloat",
+        tvm.DataTypeCode.BOOL: "bool",
+    }
+    family = families.get(dtype.type_code)
+    return (family, dtype.bits) if family is not None else (name, 0)
 
 
 def _check_handle_dtype(arg_index: int, torch_dtype: str, expected: str) -> None:
@@ -362,35 +389,13 @@ def _check_handle_dtype(arg_index: int, torch_dtype: str, expected: str) -> None
     )
 
 
-def _encode_scalar_arg(arg_index: int, kind: str, value: Any) -> int:
-    """Validate and encode one scalar kernel argument as int64.
-
-    Rejects type mismatches (e.g. float passed to an int kind) and values
-    outside the kind's range -- both would otherwise be silently truncated.
-    """
-    # Normalize numpy / torch scalar wrappers (they expose .item()).
-    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
-        value = value.item()
-    if kind in _INT_KIND_RANGES:
-        if not isinstance(value, int):
-            raise TypeError(
-                f"argument {arg_index} expects an int (`{kind}`), got {type(value).__name__} {value!r}; convert explicitly with int()"
-            )
-        low, high = _INT_KIND_RANGES[kind]
-        if not low <= value <= high:
-            raise ValueError(f"argument {arg_index} value {value} is out of range for `{kind}` [{low}, {high}]")
-        return value
-    if kind in ("float32", "float64"):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError(f"argument {arg_index} expects a float (`{kind}`), got {type(value).__name__} {value!r}")
-        as_float = float(value)
-        if kind == "float32":
-            packed = struct.unpack("<f", struct.pack("<f", as_float))[0]
-            if math.isfinite(as_float) and (math.isinf(packed) or math.isnan(packed)):
-                raise OverflowError(f"argument {arg_index} value {as_float!r} overflows the float32 range")
-            return struct.unpack("<i", struct.pack("<f", as_float))[0]
-        return struct.unpack("<q", struct.pack("<d", as_float))[0]
-    raise ValueError(f"unsupported arg kind `{kind}`")  # pragma: no cover - extract_launch_info rejects these
+def _encode_scalar_arg(kind: str, value: Any) -> int:
+    """Encode a scalar argument into the int64 representation used by the launcher."""
+    if kind == "float32":
+        return struct.unpack("<i", struct.pack("<f", value))[0]
+    if kind == "float64":
+        return struct.unpack("<q", struct.pack("<d", value))[0]
+    return int(value)
 
 
 class TileObjKernel:
@@ -407,7 +412,7 @@ class TileObjKernel:
         self.info = info
         self.obj_bytes = obj_bytes
         self.grid_override = grid_override
-        self.ubuf_override = ubuf_override
+        self.ubuf_override = 0 if ubuf_override is None else ubuf_override
         self.binary_kind = _normalize_binary_kind(binary_kind)
         self.trailing_grid_dims = tuple(info.trailing_grid_dims) if info.trailing_grid_dims else None
         self._launch = tvm.ffi.get_global_func("tl.tile.LaunchKernelWithBinaryKind")
@@ -417,25 +422,66 @@ class TileObjKernel:
                 "(see src/tile/CMakeLists.txt)"
             )
 
-    def _build_var_map(self, args: list[Any]) -> dict[str, int]:
-        """Bind plain-Var shape dims to the concrete tensor shapes."""
-        torch = _torch_module()
-        var_map: dict[str, int] = {}
-        handle_index = 0
-        for i, kind in enumerate(self.info.arg_types):
-            if kind != "handle":
+    def _resolve_dynamic_symbol(
+        self,
+        name: str,
+        args: list[Any],
+    ) -> int:
+        candidates = self.info.dynamic_symbol_sources.get(name, [])
+        unavailable: list[str] = []
+
+        for source in candidates:
+            if source.param_index >= len(args):
+                unavailable.append(
+                    f"{source.kind} source uses missing argument "
+                    f"{source.param_index}"
+                )
                 continue
-            tensor = args[i]
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"argument {i} expects a torch.Tensor (handle), got {type(tensor)}")
-            shapes = self.info.handle_shapes[handle_index]
-            if len(shapes) != tensor.dim():
-                raise ValueError(f"argument {i} expects rank {len(shapes)} but got {tensor.dim()}")
-            for expr, value in zip(shapes, tensor.shape):
-                if isinstance(expr, tirx.Var):
-                    var_map[getattr(expr, "name", str(expr))] = int(value)
-            handle_index += 1
-        return var_map
+
+            value = args[source.param_index]
+
+            if source.kind == "scalar":
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    unavailable.append(
+                        f"argument {source.param_index} is not a scalar"
+                    )
+                    continue
+
+            if source.kind == "shape":
+                try:
+                    return int(value.shape[source.dim_index])
+                except (AttributeError, IndexError, TypeError):
+                    unavailable.append(
+                        f"argument {source.param_index} has no shape dimension "
+                        f"{source.dim_index}"
+                    )
+                    continue
+            if source.kind == "stride":
+                try:
+                    stride = value.stride()[source.dim_index]
+                    return int(stride) * source.scale
+                except (AttributeError, IndexError, TypeError):
+                    unavailable.append(
+                        f"argument {source.param_index} has no stride dimension "
+                        f"{source.dim_index}"
+                    )
+                    continue
+
+            unavailable.append(f"unknown source kind: {source.kind}")
+
+        details = "; ".join(unavailable) or "no runtime source was recorded"
+        raise ValueError(
+            f"cannot resolve dynamic grid variable `{name}`: {details}"
+        )
+
+    def _build_var_map(self, args: list[Any]) -> dict[str, int]:
+        """Resolve grid variables from scalar, tensor shape and stride arguments."""
+        return {
+            name: self._resolve_dynamic_symbol(name, args)
+            for name in self.info.dynamic_symbol_sources
+        }
 
     def _compute_grid(self, args: list[Any]) -> int:
         if self.grid_override is not None:
@@ -445,15 +491,11 @@ class TileObjKernel:
         for expr in self.info.grid_exprs:
             grid *= _eval_expr(expr, var_map)
         if grid <= 0:
-            raise ValueError(f"computed grid {grid} is not positive; check the kernel shapes")
+            raise ValueError(f"computed grid {grid} is not positive; check the runtime shapes and scalar arguments")
         return grid
 
-    def _compute_ubuf(self, args: list[Any]) -> int:
-        if self.ubuf_override is not None:
-            return self.ubuf_override
-        if self.info.ubuf_expr is None:
-            return 0
-        return _eval_expr(self.info.ubuf_expr, self._build_var_map(args))
+    def _compute_ubuf(self) -> int:
+        return self.ubuf_override
 
     def _encode_args(self, args: list[Any]) -> list[int]:
         torch = _torch_module()
@@ -481,7 +523,7 @@ class TileObjKernel:
                 encoded.append(int(value.data_ptr()))
                 handle_index += 1
             else:
-                encoded.append(_encode_scalar_arg(i, kind, value))
+                encoded.append(_encode_scalar_arg(kind, value))
         return encoded
 
     def __call__(self, *args: Any) -> None:
@@ -495,262 +537,11 @@ class TileObjKernel:
             )
         arg_list = list(args)
         grid = self._compute_grid(arg_list)
-        ubuf = self._compute_ubuf(arg_list)
+        ubuf = self._compute_ubuf()
+        arg_list.extend(trailing)
         encoded = self._encode_args(arg_list)
         stream = _current_npu_stream()
         self._launch(self.obj_bytes, self.info.name, grid, ubuf, stream, self.info.arg_types, encoded, self.binary_kind)
-
-@dataclasses.dataclass
-class _ElfSymbol:
-    """Minimal view of an ELF symbol relevant to contract checking."""
-
-    name: str
-    st_type: int  # STT_OBJECT=1 / STT_FUNC=2
-    st_size: int
-    st_binding: int
-
-
-# ---------------------------------------------------------------------------
-# ELF layout constants (generic System V ELF ABI; apply to any ELF object).
-# Field offsets are fixed by the ABI per class (ELFCLASS32 / ELFCLASS64).
-# ---------------------------------------------------------------------------
-_ELF_MAGIC = b"\x7fELF"
-_ELFCLASS32, _ELFCLASS64 = 1, 2
-_ELFDATA2LSB, _ELFDATA2MSB = 1, 2
-# ELF header field offsets.
-_EHDR_SH_OFF_OFFSET = {32: 0x20, 64: 0x28}  # e_shoff
-_EHDR_SH_ENTSIZE_OFFSET = {32: 0x2E, 64: 0x3A}  # e_shentsize
-_EHDR_SH_NUM_OFFSET = {32: 0x30, 64: 0x3C}  # e_shnum
-# Section header field offsets.
-_SHDR_TYPE_OFFSET = 4  # sh_type (same for both classes)
-_SHDR_OFFSET_OFFSET = {32: 16, 64: 24}  # sh_offset
-_SHDR_SIZE_OFFSET = {32: 20, 64: 32}  # sh_size
-_SHDR_LINK_OFFSET = {32: 24, 64: 40}  # sh_link (index of linked strtab)
-_SHDR_ENTSIZE_OFFSET = {32: 36, 64: 56}  # sh_entsize
-# Section types (SHT_*).
-_SHT_SYMTAB, _SHT_STRTAB, _SHT_DYNSYM = 2, 3, 11
-# Symbol entry field offsets and entry size.  Elf32_Sym and Elf64_Sym differ
-# in field order: Elf32 is {st_name, st_value, st_size, st_info, st_other,
-# st_shndx} while Elf64 is {st_name, st_info, st_other, st_shndx, st_value,
-# st_size}, so st_info / st_size offsets must be selected per class.
-_SYM_NAME_OFFSET = 0  # st_name (offset into strtab)
-_SYM_INFO_OFFSET = {32: 12, 64: 4}  # st_info (low 4 bits = type, high 4 = binding)
-_SYM_SIZE_OFFSET = {32: 8, 64: 16}  # st_size
-_SYM_ENTRY_SIZE = {32: 16, 64: 24}
-# Symbol types (STT_*).
-_STT_OBJECT, _STT_FUNC = 1, 2
-
-
-def _read_elf_symbols(data: bytes) -> dict[str, _ElfSymbol]:
-    """
-    Parse .symtab/.dynsym from a raw ELF image (zero extra dependencies).
-
-    Verified to match pyelftools on the repo's hand-compiled .o files.
-    """
-    if data[:4] != _ELF_MAGIC:
-        raise ValueError("invalid ELF magic (bad magic)")
-    cls, endian = data[4], data[5]
-    if cls not in (_ELFCLASS32, _ELFCLASS64) or endian not in (_ELFDATA2LSB, _ELFDATA2MSB):
-        raise ValueError("invalid ELF class or endianness")
-
-    # The *_OFFSET dicts are keyed by the class bit-width (32/64); translate
-    # the ELFCLASS enum value (1/2) to the bit-width before indexing.
-    bits = 32 if cls == _ELFCLASS32 else 64
-    eo = "<" if endian == _ELFDATA2LSB else ">"
-    size_t = "Q" if bits == 64 else "I"
-    e_shoff = struct.unpack_from(eo + size_t, data, _EHDR_SH_OFF_OFFSET[bits])[0]
-    e_shentsize, e_shnum = struct.unpack_from(eo + "HH", data, _EHDR_SH_ENTSIZE_OFFSET[bits])
-    sh_offset_off = _SHDR_OFFSET_OFFSET[bits]
-    sh_size_off = _SHDR_SIZE_OFFSET[bits]
-    sh_link_off = _SHDR_LINK_OFFSET[bits]
-    sh_entsize_off = _SHDR_ENTSIZE_OFFSET[bits]
-    sym_size_off = _SYM_SIZE_OFFSET[bits]
-    sym_info_off = _SYM_INFO_OFFSET[bits]
-    sym_size = _SYM_ENTRY_SIZE[bits]
-
-    # Collect the string tables (.strtab / .dynstr, SHT_STRTAB) keyed by
-    # section index; .symtab/.dynsym reference their strtab via sh_link.
-    strtabs: dict[int, bytes] = {}
-    for i in range(e_shnum):
-        sh = e_shoff + i * e_shentsize
-        if struct.unpack_from(eo + "I", data, sh + _SHDR_TYPE_OFFSET)[0] != _SHT_STRTAB:
-            continue
-        off = struct.unpack_from(eo + size_t, data, sh + sh_offset_off)[0]
-        size = struct.unpack_from(eo + size_t, data, sh + sh_size_off)[0]
-        strtabs[i] = data[off : off + size]
-
-    symbols: dict[str, _ElfSymbol] = {}
-    for i in range(e_shnum):
-        sh = e_shoff + i * e_shentsize
-        sh_type = struct.unpack_from(eo + "I", data, sh + _SHDR_TYPE_OFFSET)[0]
-        if sh_type not in (_SHT_SYMTAB, _SHT_DYNSYM):
-            continue
-        off = struct.unpack_from(eo + size_t, data, sh + sh_offset_off)[0]
-        size = struct.unpack_from(eo + size_t, data, sh + sh_size_off)[0]
-        link = struct.unpack_from(eo + "I", data, sh + sh_link_off)[0]
-        entsize = struct.unpack_from(eo + size_t, data, sh + sh_entsize_off)[0]
-        sttab = strtabs.get(link, b"")
-        for k in range(size // (entsize or sym_size)):
-            st = off + k * (entsize or sym_size)
-            st_name = struct.unpack_from(eo + "I", data, st + _SYM_NAME_OFFSET)[0]
-            if st_name >= len(sttab):
-                continue
-            end = sttab.find(b"\x00", st_name)
-            name = sttab[st_name:end].decode("utf-8", "replace") if end >= 0 else ""
-            if not name:
-                continue
-            st_type = data[st + sym_info_off] & 0xF
-            st_binding = data[st + sym_info_off] >> 4
-            st_size = struct.unpack_from(eo + size_t, data, st + sym_size_off)[0]
-            symbols.setdefault(name, _ElfSymbol(name, st_type, st_size, st_binding))
-    return symbols
-
-
-def _validate_symbol_table(info: LaunchInfo, obj_path: str | Path, obj_bytes: bytes) -> None:
-    """
-    Contract #1/#2 (symbol half): the .o must expose the kernel as a function.
-    """
-    try:
-        symbols = _read_elf_symbols(obj_bytes)
-    except Exception as e:
-        raise ValueError(f"tile object `{obj_path}` is not a readable ELF: {e}") from e
-    if not symbols:
-        raise ValueError(f"tile object `{obj_path}` has no symbol table (fully stripped?); cannot verify the kernel symbol contract.")
-    sym = symbols.get(info.name)
-    if sym is None:
-        mix_symbols = [symbols.get(f"{info.name}_mix_aic"), symbols.get(f"{info.name}_mix_aiv")]
-        if all(candidate is not None for candidate in mix_symbols):
-            for candidate in mix_symbols:
-                if candidate.st_type != _STT_FUNC:
-                    raise ValueError(
-                        f"mixed-core implementation `{candidate.name}` in  `{obj_path}` is not a function "
-                        f"(type={candidate.st_type})."
-                    )
-                if candidate.st_size == 0:
-                    raise ValueError(f"mixed-core implementaion `{candidate.name}` in `{obj_path}` has 0 size.")
-            return
-        candidates = sorted(n for n, s in symbols.items() if s.st_type == _STT_FUNC and not n.startswith("."))
-        raise ValueError(
-            f"tile object `{obj_path}` has no symbol `{info.name}`; "
-            f"(expected kernel name = IR global_symbol, or a complete "
-            f"`{info.name}_mix_aic`/`{info.name}_mix_aiv` pair). "
-            f"Available function symbols: {candidates or '(none)'}"
-        )
-    if sym.st_type != _STT_FUNC:
-        raise ValueError(
-            f"symbol `{info.name}` in `{obj_path}` is not a function (type={sym.st_type}); contract #1 requires a function symbol."
-        )
-    if sym.st_size == 0:
-        raise ValueError(f"symbol `{info.name}` in `{obj_path}` has 0 size; the kernel has no code -- wrong .o?")
-
-def _resolve_mixed_runtime_entry(kernel_name: str, symbols: dict[str, _ElfSymbol]) -> tuple[str, bool]:
-    """Map a mixed-core ELF subtask name to its base runtime entry."""
-    for suffix, peer_suffix in (("_mix_aic", "_mix_aiv"), ("_mix_aiv", "_mix_aic")):
-        if kernel_name.endswith(suffix):
-            base = kernel_name[: -len(suffix)]
-            return (base, True) if f"{base}{peer_suffix}" in symbols else (kernel_name, False)
-    is_mix = f"{kernel_name}_mix_aic" in symbols and f"{kernel_name}_mix_aiv" in symbols
-    return kernel_name, is_mix
-
-
-def _infer_binary_kind(
-    kernel_name: str,
-    symbols: dict[str, _ElfSymbol],
-) -> str | None:
-    """Infer the ACL binary kind from Ascend ELF metadata symbols."""
-    has_mix = (
-        "__CCE_Mix_Kernel_Policy" in symbols
-        or f".Mix_Kernel_Type_{kernel_name}" in symbols
-        or (
-            f"{kernel_name}_mix_aic" in symbols
-            and f"{kernel_name}_mix_aiv" in symbols
-        )
-    )
-    if has_mix:
-        # ACL loads MIX kernels through the AICORE binary magic.
-        return "aicore"
-
-    if f".AIV_Kernel_Type_{kernel_name}" in symbols:
-        return "aiv"
-
-    return None
-
-
-def _resolve_binary_kind(
-    requested: str,
-    kernel_name: str,
-    symbols: dict[str, _ElfSymbol],
-) -> str:
-    """Honor an explicit kind, otherwise infer it from ELF metadata."""
-    requested = _normalize_binary_kind(requested)
-    if requested != "auto":
-        return requested
-
-    inferred = _infer_binary_kind(kernel_name, symbols)
-    return inferred if inferred is not None else "auto"
-
-
-def _check_dwarf_signature(info: LaunchInfo, obj_bytes: bytes) -> tuple[str, str | None]:
-    """
-    Best-effort parameter-signature check via DWARF (needs debug info).
-
-    returns ("ok", None) on verified match, ("error", msg) on a definite mismatch
-        and ("warn", msg) when the signature cannot be determined statically.
-
-    e.g. non-hardwareized blockIdx -> expected+1 params ==> return error
-    """
-    try:
-        from elftools.elf.elffile import ELFFile  # optional dependency
-        import io as _io
-    except Exception:
-        return "warn", "pyelftools not installed; parameter-signature check skipped"
-    expected = len(info.arg_types)
-    try:
-        elf = ELFFile(_io.BytesIO(obj_bytes))
-        dwarf = elf.get_dwarf_info()
-        for cu in dwarf.iter_CUs():
-            for die in cu.iter_DIEs():
-                if die.tag != "DW_TAG_subprogram":
-                    continue
-                name_attr = die.attributes.get("DW_AT_name")
-                if name_attr is None or name_attr.value.decode("utf-8", "replace") != info.name:
-                    continue
-                nparams = sum(1 for child in die.iter_children() if child.tag == "DW_TAG_formal_parameter")
-                if nparams == expected:
-                    return "ok", None
-                hint = ""
-                if nparams == expected + 1:
-                    hint = (
-                        " This looks like a non-hardwareized blockIdx parameter "
-                        "(contract #3): the .o kernel still takes the i32 blockIdx "
-                        "argument but launch only passes the handles."
-                    )
-                return "error", (f"kernel `{info.name}` has {nparams} formal parameters but the IR expects {expected}.{hint}")
-    except Exception as e:
-        # Malformed DWARF must not break binding: the whole traversal is
-        # best-effort, so any parsing failure downgrades to a warning.
-        return "warn", f"cannot read DWARF debug info ({e}); signature check skipped"
-    return "warn", (
-        f"no DWARF subprogram found for `{info.name}`; cannot statically confirm "
-        "the parameter list. Make sure the .o was compiled with the blockIdx "
-        "parameter hardwareized (contract #3)."
-    )
-
-
-def _validate_tile_obj(info: LaunchInfo, obj_path: str | Path, obj_bytes: bytes) -> None:
-    """
-    Contract validation for the (artifact, .o) pairing at bind time.
-
-    Strict failures raise ValueError; undeterminable signature checks warn.
-    """
-    _validate_symbol_table(info, obj_path, obj_bytes)
-    kind, msg = _check_dwarf_signature(info, obj_bytes)
-    if kind == "error":
-        raise ValueError(msg)
-    if kind == "warn":
-        # stacklevel=3: user code -> compile_tile_obj -> _validate_tile_obj -> warn,
-        # so the warning points at the user's bind call, not tilelang internals.
-        warnings.warn(f"tile object `{obj_path}`: {msg}", stacklevel=3)
 
 
 def compile_tile_obj(
@@ -778,7 +569,10 @@ def compile_tile_obj(
     grid_override : int, optional
         Skip TIR grid extraction and always launch with this block count.
     ubuf_override : int, optional
-        Skip TIR UBUF extraction and always pass this dynamic UBUF size.
+        Additional dynamic UBUF size in bytes passed through the ACL launch
+        attribute. CANN Runtime adds it to the compiler-allocated static UB
+        recorded in the object metadata. When omitted, zero is passed, which
+        is the normal setting for statically planned OpenTileAS kernels.
     binary_kind : str, optional
         ACL object kind. Use ``"aiv"`` for vector-only objects and
         ``"aicore"`` for generic or mixed AIC/AIV objects. ``"auto"`` keeps
@@ -808,18 +602,23 @@ def compile_tile_obj(
         raise TypeError(f"compile_tile_obj expects a PrimFunc, CompiledArtifact or IRModule, got {type(func_or_artifact).__name__}")
 
     info = extract_launch_info(lowered_mod, expect_name=expect_name)
+
+    if ubuf_override is not None:
+        if not isinstance(ubuf_override, int) or ubuf_override < 0:
+            raise ValueError(
+                "ubuf_override must be a non-negative integer, "
+                f"got {ubuf_override}"
+            )
+    runtime_ubuf_size = 0 if ubuf_override is None else ubuf_override
     obj_bytes = Path(obj_path).read_bytes()
-    try:
-        symbols = _read_elf_symbols(obj_bytes)
-    except Exception as exc:
-        raise ValueError(f"tile object `{obj_path}` is not a readable ELF: {exc}") from exc
-    normalized_binary_kind = _resolve_binary_kind(binary_kind, info.name, symbols)
-    _validate_tile_obj(info, obj_path, obj_bytes)
+
+    normalized_binary_kind = _normalize_binary_kind(binary_kind)
+
     return TileObjKernel(
         info,
         obj_bytes,
         grid_override=grid_override,
-        ubuf_override=ubuf_override,
+        ubuf_override=runtime_ubuf_size,
         binary_kind=normalized_binary_kind,
     )
 
@@ -835,10 +634,10 @@ def load_tile_obj(
 ) -> TileObjKernel:
     """Bind a raw CCE object using an explicit launch manifest.
 
-    Unlike :func:`compile_tile_obj`, this entry point does not require a
-    lowered TileLang artifact. Kernel name, argument ABI, grid, dynamic UBUF,
-    and binary kind must come from a trusted manifest such as onboard's
-    ``runner.json``; they cannot be recovered reliably from a stripped ``.o``.
+    Unlike :func:`compile_tile_obj`, this entry point does not require a lowered TileLang artifact. 
+    Kernel name, argument ABI, grid, additional dynamic UBUF, and binary kind 
+    must come from a trusted manifest such as onboard's ``runner.json``; 
+    they cannot be recovered reliably from a stripped ``.o``.
     ``handle_dtypes`` should list one dtype per ``handle`` argument; omitted
     dtypes are treated as unknown and only produce a launch-time warning.
     ``grid_dims``, when given as ``(gridX, gridY, gridZ)`` appends three
@@ -874,28 +673,17 @@ def load_tile_obj(
         arg_types.extend(["int32", "int32", "int32"])
 
     obj_bytes = Path(obj_path).read_bytes()
-    try:
-        symbols = _read_elf_symbols(obj_bytes)
-    except Exception as exc:
-        raise ValueError(f"tile object `{obj_path}` is not a readable ELF: {exc}") from exc
-    runtime_name, _ = _resolve_mixed_runtime_entry(kernel_name, symbols)
-    if runtime_name != kernel_name:
-        warnings.warn(
-            f"`{kernel_name}` is a mixed-core ELF subtask; using base runtime entry `{runtime_name}`",
-            stacklevel=2,
-        )
-    normalized_binary_kind = _resolve_binary_kind(binary_kind, runtime_name, symbols)
+    normalized_binary_kind = _normalize_binary_kind(binary_kind)
 
     info = LaunchInfo(
-        name=runtime_name,
+        name=kernel_name,
         arg_types=arg_types,
         handle_shapes=[[] for kind in arg_types if kind == "handle"],
         handle_dtypes=handle_dtypes,
         grid_exprs=[],
-        ubuf_expr=None,
         trailing_grid_dims=grid_dims,
     )
-    _validate_tile_obj(info, obj_path, obj_bytes)
+
     return TileObjKernel(
         info,
         obj_bytes,

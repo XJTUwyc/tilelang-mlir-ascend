@@ -1,11 +1,9 @@
-"""Shared helpers for the per-TODO tile_obj test scripts in examples/ascend.
+"""Shared helpers for the tile_obj test scripts in examples/ascend.
 
-Each TODO in ``tile_obj_load_launch.md`` gets its own test script
-(``test_tile_obj_contract.py`` = TODO 3, ``test_tile_obj_dtype.py`` =
-TODO 2, ...).  This module holds the pieces every script needs:
+This module holds the pieces used by the dtype, dynamic-grid, and manifest
+tests:
 
 - the repo-root import bootstrap (so tilelang imports from the dev tree),
-- a minimal ``LaunchInfo`` factory,
 - the expect-raises assertion helper,
 - a stub ``TileObjKernel`` that skips the FFI lookup in ``__init__``,
 - the check-runner / CLI skeleton (``run_module``).
@@ -25,18 +23,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tilelang.opentile import tile_obj  # noqa: E402
-
-
-def _info(name, n_handles=3):
-    """A minimal LaunchInfo: ``n_handles`` float16 handle arguments."""
-    return tile_obj.LaunchInfo(
-        name=name,
-        arg_types=["handle"] * n_handles,
-        handle_shapes=[],
-        handle_dtypes=["float16"] * n_handles,
-        grid_exprs=[],
-        ubuf_expr=None,
-    )
 
 
 def _expect_raises(exc_type, fn, *args):

@@ -1,10 +1,10 @@
-""" E2E correntness test for a precompiled fused_matmul_bwd_w ``.o``.
+""" E2E correctness test for a precompiled fused_matmul_bwd_w ``.o``.
 
 Set ``OPENTILE_FUSED_MATMUL_BWD_W_OBJ`` to the object path, then run:
 
     python -m pytest examples/ascend/tile_obj_launch_nputest.py -x -s
 
-``OPENTILE_TEST_UBUF`` default to zero. Set it to the dynamic UBUF bytes
+``OPENTILE_TEST_UBUF`` defaults to zero. Set it to the dynamic UBUF bytes
 reported by the compiler/manifest when the object requires dynamic UBUF.
 """
 
@@ -60,19 +60,21 @@ def test_fused_matmul_bwd_w_obj(m, n, k, seed):
     dy_cpu = torch.randn((k, n), dtype=DTYPE, generator=generator)
     expected = (x_cpu.float().transpose(0, 1) @ dy_cpu.float()).to(DTYPE)
 
-    device = torch.Generator("npu", torch.npu.current_device())
+    device = torch.device("npu", torch.npu.current_device())
     x = x_cpu.to(device)
     dy = dy_cpu.to(device)
     dw = torch.full((m, n), float("nan"), dtype=DTYPE, device=device)
     lock_w = torch.zeros(32 * 1024, dtype=torch.int32, device=device)
-    
-    grid = ((m + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M, (n + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N)
+
+    grid_m = (m + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    grid_n = (n + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    grid = grid_m * grid_n
     ubuf_size = int(os.environ.get("OPENTILE_TEST_UBUF", "0"))
     kernel = load_tile_obj(
         _object_path(),
         kernel_name="fused_matmul_bwd_w_kernel",
         arg_types=["handle", "handle", "handle", "handle", "int32", "int32", "int32"],
-        handle_types=["float16", "float16", "float16", "int32"],
+        handle_dtypes=["float16", "float16", "float16", "int32"],
         grid=grid,
         ubuf_size=ubuf_size,
         binary_kind="aicore",
@@ -101,7 +103,7 @@ def test_fused_matmul_bwd_w_obj(m, n, k, seed):
     diff = (actual.float() - expected.float()).abs()
     print(
         "[E2E_COMPARE] op=fused_matmul_bwd_w tensor=dw "
-        f"shape=({m},{n}) k={k} grid={grid} ubuf={ubuf_size} "
+        f"shape=({m},{n}) k={k} grid={grid} logical_grid=({grid_m},{grid_n}) ubuf={ubuf_size} "
         f"pass=1 finite={actual.numel()}/{actual.numel()} "
         f"max_abs={float(diff.max().item()):.8g} "
         f"mean_abs={float(diff.mean().item()):.8g} "
