@@ -86,10 +86,12 @@ jobs:
           # format.sh` locally for the full auto-fixing pass.
           if [ -n "${PY_FILES// }" ]; then
             echo "ruff check (no-fix): ${PY_FILES}"
-            pipx run ruff check ${PY_FILES} --no-fix
+            # Pin to the same versions as .pre-commit-config.yaml so CI and
+            # local format.sh checks behave identically.
+            pipx run ruff==0.15.20 check ${PY_FILES} --no-fix
           fi
           echo "codespell: ${CHANGED_FILES}"
-          pipx run codespell ${CHANGED_FILES}
+          pipx run codespell==2.4.2 ${CHANGED_FILES}
 
   tests:
     name: Test for Python ${{ matrix.python-version }} with ${{ matrix.runner.toolkit }} (on ${{ matrix.runner.name }})
