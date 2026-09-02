@@ -67,7 +67,7 @@ jobs:
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" maint/scripts/audit_cpp_api_style.py --github-warnings --limit 20
 
-      - name: Pre-commit Lint (changed files only)
+      - name: Lint changed files (read-only checks)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
@@ -75,16 +75,21 @@ jobs:
             BASE_SHA="$(git rev-parse HEAD~1)"
           fi
           MERGE_BASE="$(git merge-base "${BASE_SHA}" HEAD)"
-          CHANGED_FILES="$(git diff --name-only --diff-filter=ACMRT "${MERGE_BASE}" HEAD | tr '\n' ' ')"
-          if [ -z "${CHANGED_FILES// }" ]; then
-            echo "No changed files to lint. Skipping pre-commit."
+          CHANGED_FILES="$(git diff --name-only --diff-filter=ACMRT "${MERGE_BASE}" HEAD)"
+          PY_FILES="$(echo "${CHANGED_FILES}" | grep -E '\.py$' | tr '\n' ' ')"
+          if [ -z "${CHANGED_FILES//[$' \t\r\n']/}" ]; then
+            echo "No changed files to lint. Skipping."
             exit 0
           fi
-          echo "Running pre-commit on changed files: ${CHANGED_FILES}"
-          if ! pipx run pre-commit run --files ${CHANGED_FILES} --color=always --show-diff-on-failure; then
-            echo "::error::Pre-commit checks failed on changed files: ${CHANGED_FILES}"
-            exit 1
+          # Read-only diagnostics only: no auto-fixing formatters here, so
+          # pre-existing formatting drift never blocks a PR. Run `bash
+          # format.sh` locally for the full auto-fixing pass.
+          if [ -n "${PY_FILES// }" ]; then
+            echo "ruff check (no-fix): ${PY_FILES}"
+            pipx run ruff check ${PY_FILES} --no-fix
           fi
+          echo "codespell: ${CHANGED_FILES}"
+          pipx run codespell ${CHANGED_FILES}
 
   tests:
     name: Test for Python ${{ matrix.python-version }} with ${{ matrix.runner.toolkit }} (on ${{ matrix.runner.name }})
