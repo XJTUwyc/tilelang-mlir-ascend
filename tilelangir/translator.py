@@ -869,7 +869,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"but received {src_type.shape} and {dst_type.shape}"
             )
         self._linalg.exp(src, outs=[dst])
-            
+
     def _emit_vmax(self, call: tirx.Call) -> None:
         if len(call.args) < 3:
             raise ValueError(
