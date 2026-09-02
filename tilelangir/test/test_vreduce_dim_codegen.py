@@ -29,19 +29,18 @@ def _reduce_kernel(
         A: T.Tensor((M, N), dtype),
         C: T.Tensor(tuple(dst_shape), dtype),
     ):
-        with T.Kernel(1) as bx:
-            with T.SimdVF():
-                a_frag = T.alloc_frag((M, N), dtype)
-                dst_frag = T.alloc_frag(tuple(dst_shape), dtype)
-                T.copy(A[0:M, 0:N], a_frag)
+        with T.Kernel(1), T.SimdVF():
+            a_frag = T.alloc_frag((M, N), dtype)
+            dst_frag = T.alloc_frag(tuple(dst_shape), dtype)
+            T.copy(A[0:M, 0:N], a_frag)
 
-                reduce_op = getattr(T, op_name)
-                if dim is None:
-                    reduce_op(a_frag, dst_frag)
-                else:
-                    reduce_op(a_frag, dst_frag, dim=dim)
+            reduce_op = getattr(T, op_name)
+            if dim is None:
+                reduce_op(a_frag, dst_frag)
+            else:
+                reduce_op(a_frag, dst_frag, dim=dim)
 
-                T.copy(dst_frag, C)
+            T.copy(dst_frag, C)
 
     return main
 
@@ -61,16 +60,15 @@ def _reduce_3d_kernel(
         A: T.Tensor((B, M, N), dtype),
         C: T.Tensor((M,), dtype),
     ):
-        with T.Kernel(1) as bx:
-            with T.SimdVF():
-                a_frag = T.alloc_frag((B, M, N), dtype)
-                dst_frag = T.alloc_frag((M,), dtype)
-                T.copy(A[0:B, 0:M, 0:N], a_frag)
+        with T.Kernel(1), T.SimdVF():
+            a_frag = T.alloc_frag((B, M, N), dtype)
+            dst_frag = T.alloc_frag((M,), dtype)
+            T.copy(A[0:B, 0:M, 0:N], a_frag)
 
-                reduce_op = getattr(T, op_name)
-                reduce_op(a_frag, dst_frag, dim=dim)
+            reduce_op = getattr(T, op_name)
+            reduce_op(a_frag, dst_frag, dim=dim)
 
-                T.copy(dst_frag, C)
+            T.copy(dst_frag, C)
 
     return main
 
