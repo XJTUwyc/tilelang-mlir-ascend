@@ -12,7 +12,7 @@ This module implements the runtime half only:
    - the launch grid expression (``thread_extent`` / ``blockIdx.x``),
 2. :class:`TileObjKernel` evaluates the launch grid with concrete tensor
    shapes, passes an optional additional dynamic UBUF size, encodes arguments,
-   and submits through ``tl.tile.LaunchKernelWithBinaryKind``.
+   and submits through ``tl.tile.LaunchKernel``.
 
 Notes / contract with the hand-compiled ``.o``:
 - A single-core kernel symbol must equal the IR ``global_symbol``.
@@ -71,25 +71,6 @@ _SCALAR_DTYPE_TO_KIND = {
     "bool": "int32",
 }
 
-_BINARY_KIND_ALIASES = {
-    "auto": "auto",
-    "aiv": "aiv",
-    "vector": "aiv",
-    "aic": "aicore",
-    "aicore": "aicore",
-    "mix": "aicore",
-    "aicube": "aicube",
-    "cube": "aicube",
-}
-
-def _normalize_binary_kind(binary_kind: str) -> str:
-    if not isinstance(binary_kind, str):
-        raise TypeError(f"binary_kind must be a string, got {type(binary_kind).__name__}")
-    normalized = _BINARY_KIND_ALIASES.get(binary_kind.lower())
-    if normalized is None:
-        choices = ", ".join(sorted(_BINARY_KIND_ALIASES))
-        raise ValueError(f"unsupported binary_kind `{binary_kind}`; expected one of {choices}")
-    return normalized
 
 @dataclasses.dataclass(frozen=True)
 class DynamicSymbolSource:
@@ -407,18 +388,16 @@ class TileObjKernel:
         obj_bytes: bytes,
         grid_override: int | None = None,
         ubuf_override: int | None = None,
-        binary_kind: str = "auto",
     ):
         self.info = info
         self.obj_bytes = obj_bytes
         self.grid_override = grid_override
         self.ubuf_override = 0 if ubuf_override is None else ubuf_override
-        self.binary_kind = _normalize_binary_kind(binary_kind)
         self.trailing_grid_dims = tuple(info.trailing_grid_dims) if info.trailing_grid_dims else None
-        self._launch = tvm.ffi.get_global_func("tl.tile.LaunchKernelWithBinaryKind")
+        self._launch = tvm.ffi.get_global_func("tl.tile.LaunchKernel")
         if self._launch is None:
             raise RuntimeError(
-                "tl.tile.LaunchKernelWithBinaryKind is not registered; rebuild tilelang with src/tile enabled "
+                "tl.tile.LaunchKernel is not registered; rebuild tilelang with src/tile enabled "
                 "(see src/tile/CMakeLists.txt)"
             )
 
@@ -541,7 +520,7 @@ class TileObjKernel:
         arg_list.extend(trailing)
         encoded = self._encode_args(arg_list)
         stream = _current_npu_stream()
-        self._launch(self.obj_bytes, self.info.name, grid, ubuf, stream, self.info.arg_types, encoded, self.binary_kind)
+        self._launch(self.obj_bytes, self.info.name, grid, ubuf, stream, self.info.arg_types, encoded)
 
 
 def compile_tile_obj(
@@ -549,7 +528,6 @@ def compile_tile_obj(
     obj_path: str | Path,
     grid_override: int | None = None,
     ubuf_override: int | None = None,
-    binary_kind: str = "auto",
 ) -> TileObjKernel:
     """Bind a hand-compiled object to TileLang kernel metadata.
 
@@ -573,10 +551,6 @@ def compile_tile_obj(
         attribute. CANN Runtime adds it to the compiler-allocated static UB
         recorded in the object metadata. When omitted, zero is passed, which
         is the normal setting for statically planned OpenTileAS kernels.
-    binary_kind : str, optional
-        ACL object kind. Use ``"aiv"`` for vector-only objects and
-        ``"aicore"`` for generic or mixed AIC/AIV objects. ``"auto"`` keeps
-        the ACL default behavior.
     """
     # No top-level torch import here: compile_tile_obj only inspects already
     # lowered artifacts/modules, so it must not pull in tilelang.engine.param
@@ -612,14 +586,11 @@ def compile_tile_obj(
     runtime_ubuf_size = 0 if ubuf_override is None else ubuf_override
     obj_bytes = Path(obj_path).read_bytes()
 
-    normalized_binary_kind = _normalize_binary_kind(binary_kind)
-
     return TileObjKernel(
         info,
         obj_bytes,
         grid_override=grid_override,
         ubuf_override=runtime_ubuf_size,
-        binary_kind=normalized_binary_kind,
     )
 
 def load_tile_obj(
@@ -628,15 +599,15 @@ def load_tile_obj(
     arg_types: list[str] | tuple[str, ...],
     grid: int,
     ubuf_size: int = 0,
-    binary_kind: str = "auto",
     handle_dtypes: list[str] | tuple[str, ...] | None = None,
     grid_dims: tuple[int, int, int] | None = None,
 ) -> TileObjKernel:
     """Bind a raw CCE object using an explicit launch manifest.
 
-    Unlike :func:`compile_tile_obj`, this entry point does not require a lowered TileLang artifact. 
-    Kernel name, argument ABI, grid, additional dynamic UBUF, and binary kind 
-    must come from a trusted manifest such as onboard's ``runner.json``; 
+    Unlike :func:`compile_tile_obj`, this entry point does not require a lowered
+    TileLang artifact.
+    Kernel name, argument ABI, grid, and additional dynamic UBUF
+    must come from a trusted manifest such as onboard's ``runner.json``;
     they cannot be recovered reliably from a stripped ``.o``.
     ``handle_dtypes`` should list one dtype per ``handle`` argument; omitted
     dtypes are treated as unknown and only produce a launch-time warning.
@@ -673,7 +644,6 @@ def load_tile_obj(
         arg_types.extend(["int32", "int32", "int32"])
 
     obj_bytes = Path(obj_path).read_bytes()
-    normalized_binary_kind = _normalize_binary_kind(binary_kind)
 
     info = LaunchInfo(
         name=kernel_name,
@@ -689,5 +659,4 @@ def load_tile_obj(
         obj_bytes,
         grid_override=grid,
         ubuf_override=ubuf_size,
-        binary_kind=normalized_binary_kind,
     )

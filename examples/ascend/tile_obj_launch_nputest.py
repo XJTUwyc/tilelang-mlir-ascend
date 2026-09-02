@@ -77,7 +77,6 @@ def test_fused_matmul_bwd_w_obj(m, n, k, seed):
         handle_dtypes=["float16", "float16", "float16", "int32"],
         grid=grid,
         ubuf_size=ubuf_size,
-        binary_kind="aicore",
         grid_dims=(grid, 1, 1),
     )
 
