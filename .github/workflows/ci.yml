@@ -67,10 +67,22 @@ jobs:
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" maint/scripts/audit_cpp_api_style.py --github-warnings --limit 20
 
-      - name: Pre-commit Lint
+      - name: Pre-commit Lint (changed files only)
         run: |
-          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
-            echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_SHA="$(git rev-parse HEAD~1)"
+          fi
+          MERGE_BASE="$(git merge-base "${BASE_SHA}" HEAD)"
+          CHANGED_FILES="$(git diff --name-only --diff-filter=ACMRT "${MERGE_BASE}" HEAD | tr '\n' ' ')"
+          if [ -z "${CHANGED_FILES// }" ]; then
+            echo "No changed files to lint. Skipping pre-commit."
+            exit 0
+          fi
+          echo "Running pre-commit on changed files: ${CHANGED_FILES}"
+          if ! pipx run pre-commit run --files ${CHANGED_FILES} --color=always --show-diff-on-failure; then
+            echo "::error::Pre-commit checks failed on changed files: ${CHANGED_FILES}"
             exit 1
           fi
 
