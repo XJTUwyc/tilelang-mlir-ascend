@@ -442,6 +442,24 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.mul(src0, src1, outs=[dst])
 
+    def _emit_broadcast(self, call: tirx.Call) -> None:
+        if len(call.args) != 2:
+            raise ValueError(
+                f"tl.tileop.broadcast expects 2 arguments, but received {len(call.args)}"
+            )
+        src = self._get_or_create_expr_value(call.args[0])
+        dst = self._get_or_create_expr_value(call.args[1])
+        src_type = self._ir.MemRefType(src.type)
+        dst_type = self._ir.MemRefType(dst.type)
+        if dst_type.rank < src_type.rank:
+            raise ValueError(
+                f"tl.tileop.broadcast expects dst rank >= src rank, but got "
+                f"{src_type.rank} -> {dst_type.rank}"
+            )
+        src_shape = list(src_type.shape)
+        dst_shape = list(dst_type.shape) 
+        broadcast_dims = self._infer_broadcast_dims(src_shape, dst_shape)
+        self._linalg.broadcast(src, outs=[dst], dimensions=broadcast_dims)
     def _emit_vdiv(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(f"tl.tileop.vdiv expects 3 arguments, but received {len(call.args)}")
@@ -636,6 +654,36 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             else:
                 reduce_dims.append(src_idx)
         return reduce_dims
+
+    @staticmethod
+    def _infer_broadcast_dims(
+        src_shape: list[int], dst_shape: list[int]
+    ) -> list[int]:
+        """Infer linalg.broadcast dimensions by matching src dims to dst dims.
+
+        src dims are matched in order to dst dims with equal extents; dst dims
+        left unmatched are broadcast, and extent-1 src dims are treated as
+        broadcastable. This supports both (M,) -> (M, N) and (N,) -> (M, N)
+        broadcasts as well as same-rank extent-1 broadcasts like
+        (M, 1) -> (M, N) or (1, N) -> (M, N).
+        """
+        broadcast_dims: list[int] = []
+        src_idx = 0
+        for dst_idx, dst_extent in enumerate(dst_shape):
+            if src_idx >= len(src_shape):
+                broadcast_dims.append(dst_idx)
+            elif src_shape[src_idx] == dst_extent:
+                src_idx += 1  # matched dim, kept as-is
+            elif src_shape[src_idx] == 1:
+                broadcast_dims.append(dst_idx)  # extent-1 src dim is broadcast
+                src_idx += 1
+            else:
+                broadcast_dims.append(dst_idx)  # no src dim for this dst dim
+        if src_idx < len(src_shape):
+            raise ValueError(
+                f"tl.tileop.broadcast cannot broadcast shape {src_shape} to {dst_shape}"
+            )
+        return broadcast_dims
 
     def _create_rank_reduced_view(
         self, dst: Any, dst_type: Any, init_shape: list[int], element_type: Any
@@ -1436,6 +1484,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_vadd(op)
         elif op_name == "tl.tileop.vmul":
             self._emit_vmul(op)
+        elif op_name == "tl.tileop.broadcast":
+            self._emit_broadcast(op)
         elif op_name == "tl.tileop.vdiv":
             self._emit_vdiv(op)
         elif op_name == "tl.tileop.vsub":

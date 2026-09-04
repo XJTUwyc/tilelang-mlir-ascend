@@ -29,6 +29,12 @@ TVM_REGISTER_OP("tl.tileop.vmul")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TVM_REGISTER_OP("tl.tileop.broadcast")
+    .set_num_inputs(2)
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "broadcast")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TVM_REGISTER_OP("tl.tileop.vsub")
     .set_num_inputs(3)
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "vsub")

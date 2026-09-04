@@ -188,3 +188,17 @@ def vcvt(src: OperandType, dst: OperandType, dtype: DType) -> tirx.PrimExpr:
         _normalize_operand(dst, access_type="w"),
         tirx.StringImm(str(dtype)),
     )
+
+
+def broadcast(src: OperandType, dst: OperandType) -> tirx.PrimExpr:
+    """Broadcast a vector region to a higher-rank vector region.
+
+    ``src`` and ``dst`` must be Buffer or BufferRegion operands; ``dst`` must
+    have a higher rank than ``src``.  The trailing rank difference of ``dst``
+    is inserted (e.g. a (BR,) row becomes (BR, D)).
+    """
+    return _call_vector_op(
+        "broadcast",
+        _normalize_operand(src, access_type="r"),
+        _normalize_operand(dst, access_type="w"),
+    )

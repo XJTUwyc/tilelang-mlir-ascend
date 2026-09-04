@@ -28,6 +28,7 @@ from .loop import (
 )
 from .scope import SimdVF, SimtVF  # noqa: F401
 from .simd import (  # noqa: F401
+    broadcast,
     vadd,
     vcvt,
     vdiv,
