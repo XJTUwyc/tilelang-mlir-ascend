@@ -121,5 +121,131 @@ def TileLang_ScopeYieldOp : TileLang_Op<"scope_yield", [
   let assemblyFormat = "attr-dict";
 }
 
+// ---------------------------------------------------------------------------
+// tilelang.vcvt
+// Matches Python: VcvtOp(src, dst, *, src_dtype, dst_dtype)
+// Generic form: "tilelang.vcvt"(%src, %dst) {src_dtype, dst_dtype}
+//               : (memref, memref) -> ()
+// ---------------------------------------------------------------------------
+def TileLang_VcvtOp : TileLang_Op<"vcvt"> {
+  let summary = "Elementwise type conversion between two memref operands";
+  let description = [{
+    `tilelang.vcvt` converts the source memref element type to the destination
+    memref element type elementwise. The required `src_dtype`/`dst_dtype`
+    string attributes preserve the frontend TIRX dtype names (e.g. `"uint8"`,
+    `"float32"`) whose signedness is lost in signless memref element types;
+    the backend reconstructs the cast `type_fn` from them.
+  }];
+
+  let arguments = (ins
+    Arg<AnyMemRef, "source memref", [MemRead]>:$src,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dst,
+    StrAttr:$src_dtype,
+    StrAttr:$dst_dtype
+  );
+
+  let assemblyFormat =
+    "$src `,` $dst attr-dict `:` type($src) `to` type($dst)";
+}
+
+// ---------------------------------------------------------------------------
+// tilelang.vexpdif
+// Matches Python: VexpdifOp(src0, src1, dst)
+// Generic form: "tilelang.vexpdif"(%src0, %src1, %dst)
+//               : (memref, memref, memref) -> ()
+// ---------------------------------------------------------------------------
+def TileLang_VexpdifOp : TileLang_Op<"vexpdif"> {
+  let summary = "Elementwise exp(src0 - src1) on memref operands";
+  let description = [{
+    `tilelang.vexpdif` computes `exp(src0 - src1)` elementwise from two source
+    memrefs into a destination memref.
+  }];
+
+  let arguments = (ins
+    Arg<AnyMemRef, "first source memref", [MemRead]>:$src0,
+    Arg<AnyMemRef, "second source memref", [MemRead]>:$src1,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dst
+  );
+
+  let assemblyFormat =
+    "$src0 `,` $src1 `,` $dst attr-dict `:` type($src0) `,` type($src1) `to` type($dst)";
+}
+
+// ---------------------------------------------------------------------------
+// tilelang.vmuls
+// Matches Python: VmulsOp(src, scalar, dst)
+// Generic form: "tilelang.vmuls"(%src, %scalar, %dst)
+//               : (memref, scalar, memref) -> ()
+// ---------------------------------------------------------------------------
+def TileLang_VmulsOp : TileLang_Op<"vmuls"> {
+  let summary = "Elementwise src * scalar on a memref and a scalar operand";
+  let description = [{
+    `tilelang.vmuls` multiplies the source memref elementwise by an explicit
+    scalar SSA operand and writes the result to the destination memref. The
+    scalar is an operand rather than a region free variable.
+  }];
+
+  let arguments = (ins
+    Arg<AnyMemRef, "source memref", [MemRead]>:$src,
+    AnyType:$scalar,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dst
+  );
+
+  let assemblyFormat =
+    "$src `,` $scalar `,` $dst attr-dict `:` type($src) `,` type($scalar) `to` type($dst)";
+}
+
+// ---------------------------------------------------------------------------
+// tilelang.vmax
+// Matches Python: VmaxOp(src0, src1, dst, *, dtype)
+// Generic form: "tilelang.vmax"(%src0, %src1, %dst) {dtype}
+//               : (memref, memref, memref) -> ()
+// ---------------------------------------------------------------------------
+def TileLang_VmaxOp : TileLang_Op<"vmax"> {
+  let summary = "Elementwise maximum of two memref operands";
+  let description = [{
+    `tilelang.vmax` computes the elementwise maximum of two source memrefs
+    into a destination memref. The required `dtype` string attribute preserves
+    the frontend TIRX dtype name (e.g. `"uint8"`, `"float32"`) so the backend
+    can pick the right signedness.
+  }];
+
+  let arguments = (ins
+    Arg<AnyMemRef, "first source memref", [MemRead]>:$src0,
+    Arg<AnyMemRef, "second source memref", [MemRead]>:$src1,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dst,
+    StrAttr:$dtype
+  );
+
+  let assemblyFormat =
+    "$src0 `,` $src1 `,` $dst attr-dict `:` type($src0) `,` type($src1) `to` type($dst)";
+}
+
+// ---------------------------------------------------------------------------
+// tilelang.vsub
+// Matches Python: VsubOp(src0, src1, dst)
+// Generic form: "tilelang.vsub"(%src0, %src1, %dst)
+//               : (memref, memref, memref) -> ()
+// ---------------------------------------------------------------------------
+def TileLang_VsubOp : TileLang_Op<"vsub"> {
+  let summary = "Elementwise subtraction of two memref operands";
+  let description = [{
+    `tilelang.vsub` subtracts the second source memref from the first
+    elementwise and writes the result to the destination memref. Broadcast
+    relationships are inferred from the operand memref shapes; the backend
+    inserts a `npu.broadcast` when a reaching vector definition has a
+    different shape than the destination fragment.
+  }];
+
+  let arguments = (ins
+    Arg<AnyMemRef, "first source memref", [MemRead]>:$src0,
+    Arg<AnyMemRef, "second source memref", [MemRead]>:$src1,
+    Arg<AnyMemRef, "destination memref", [MemWrite]>:$dst
+  );
+
+  let assemblyFormat =
+    "$src0 `,` $src1 `,` $dst attr-dict `:` type($src0) `,` type($src1) `to` type($dst)";
+}
+
 
 #endif // TILELANG_DIALECT_IR_TILELANGOPS_TD

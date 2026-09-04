@@ -10,6 +10,7 @@ from .vector import (
     vmuls,
     vreduce_max,
     vreduce_sum,
+    vsub,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "vmuls",
     "vreduce_max",
     "vreduce_sum",
+    "vsub",
 ]

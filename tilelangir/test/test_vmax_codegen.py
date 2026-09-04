@@ -1,14 +1,11 @@
 """TileLangIR ``tl.tileop.vmax`` codegen tests.
 
-Verifies that ``T.vmax`` in the DSL lowers to a ``linalg.generic`` op whose
-body uses the dtype-appropriate ``arith`` max op:
-
-- float   -> ``arith.maxf``
-- unsigned integer -> ``arith.maxui``
-- signed integer   -> ``arith.maxsi``
-
-These are pure IR codegen tests: they call ``tilelang.lower(..., target="tile")``
-and assert on the generated MLIR source string. No Ascend hardware required.
+Verifies that ``T.vmax`` in the DSL lowers to a ``tilelang.vmax`` custom
+dialect op whose ``dtype`` attribute preserves the frontend TIRX dtype name
+(float32 / uint32 / int32), which carries the signedness the signless memref
+element type drops.  These are pure IR codegen tests: they call
+``tilelang.lower(..., target="tile")`` and assert on the generated MLIR source
+string.  No Ascend hardware required.
 """
 
 import re
@@ -24,7 +21,7 @@ def _vmax_kernel(
     block_M: int = 32,
     dtype: str = "float32",
 ):
-    """Build a minimal vmax kernel ``C = elementwise_max(A, B)`` (one block per row-tile)."""
+    """Build a minimal vmax kernel ``C = elementwise_max(A, B)``."""
     num_blocks = M // block_M
     VL = 64
 
@@ -68,98 +65,63 @@ def _lower_to_tile_source(kernel):
     return artifact.kernel_source
 
 
-# Regex that matches a ``linalg.generic`` op and captures its full content.
-_LINALG_GENERIC_RE = re.compile(
-    r"linalg\.generic\s*\{[^}]*\}\s*ins\([^)]*\)\s*outs\([^)]*\)\s*\{[^}]*\}",
-    re.MULTILINE | re.DOTALL,
-)
-
-
-def _assert_linalg_generic(source: str) -> re.Match:
-    """Assert that the source contains at least one ``linalg.generic`` op."""
-    match = _LINALG_GENERIC_RE.search(source)
+def _extract_vmax_op(source: str) -> str:
+    """Return the ``tilelang.vmax`` operation emitted for ``T.vmax``."""
+    match = re.search(r'"tilelang\.vmax"\([^)]*\)[^{]*\{[^}]*\}[^:]*:[^)]*\)',
+                      source)
     assert match is not None, (
-        "Expected a ``linalg.generic`` op in the generated MLIR, but none was found.\n"
-        f"Source:\n{source}"
+        "Expected a ``tilelang.vmax`` op in the generated MLIR, but none was "
+        f"found.\nSource:\n{source}"
     )
-    return match
+    return match.group(0)
 
 
-def test_vmax_basic_lowers_to_linalg_generic():
-    """C = max(A, B) must emit at least one ``linalg.generic``."""
+def test_vmax_basic_lowers_to_tilelang_vmax():
+    """C = max(A, B) must emit at least one ``tilelang.vmax``."""
     source = _lower_to_tile_source(_vmax_kernel())
-    _assert_linalg_generic(source)
+    assert "tilelang.vmax" in source
 
 
 def test_vmax_operand_has_fragment_address_space():
-    """Both ``ins`` and ``outs`` memrefs should live in address space 2 (fragment)."""
+    """The vmax op's memref operands should live in address space 2 (fragment)."""
     source = _lower_to_tile_source(_vmax_kernel())
-    match = _assert_linalg_generic(source)
-    op_text = match.group(0)
-    # Fragment buffers have address space 2 in the MLIR output.
-    assert "memref<64xf32, strided<[1]>, 2>" in op_text, (
+    op_text = _extract_vmax_op(source)
+    assert "memref<64xf32, 2>" in op_text, (
         f"Expected fragment memref with address space 2, got:\n{op_text}"
     )
 
 
-def test_vmax_two_inputs():
-    """``linalg.generic`` must have two fragment memref inputs."""
+def test_vmax_float_dtype_attr():
+    """float32 vmax must carry ``dtype = "float32"``."""
     source = _lower_to_tile_source(_vmax_kernel())
-    match = _assert_linalg_generic(source)
-    op_text = match.group(0)
-    # Count fragment memref references in the ins() list.
-    ins_count = op_text.count("memref<64xf32, strided<[1]>, 2>")
-    assert ins_count >= 2, (
-        f"Expected at least 2 fragment memref inputs in linalg.generic, got {ins_count}.\n"
-        f"Op text:\n{op_text}"
+    op_text = _extract_vmax_op(source)
+    assert 'dtype = "float32"' in op_text, (
+        f"Expected dtype = \"float32\".\nOp text:\n{op_text}"
     )
 
 
-def test_vmax_body_has_arith_maxf():
-    """The ``linalg.generic`` body must contain ``arith.maxf`` for float dtype."""
-    source = _lower_to_tile_source(_vmax_kernel())
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    assert "arith.maximumf" in body, (
-        "Expected ``arith.maxf`` in the linalg.generic body.\n"
-        f"Body:\n{body}"
-    )
-
-
-def test_vmax_unsigned_dtype_uses_maxui():
-    """Unsigned integer vmax must emit ``arith.maxui`` in the body."""
+def test_vmax_unsigned_dtype_attr():
+    """uint32 vmax must carry ``dtype = "uint32"`` (unsigned signedness)."""
     source = _lower_to_tile_source(_vmax_kernel(dtype="uint32"))
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    assert "arith.maxui" in body, (
-        "Expected ``arith.maxui`` for unsigned vmax.\n"
-        f"Body:\n{body}"
-    )
-    assert "arith.maximumf" not in body, (
-        "Unsigned vmax should not emit ``arith.maxf``.\n"
-        f"Body:\n{body}"
+    op_text = _extract_vmax_op(source)
+    assert 'dtype = "uint32"' in op_text, (
+        f"Expected dtype = \"uint32\".\nOp text:\n{op_text}"
     )
 
 
-def test_vmax_signed_dtype_uses_maxsi():
-    """Signed integer vmax must emit ``arith.maxsi`` in the body."""
+def test_vmax_signed_dtype_attr():
+    """int32 vmax must carry ``dtype = "int32"`` (signed signedness)."""
     source = _lower_to_tile_source(_vmax_kernel(dtype="int32"))
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    assert "arith.maxsi" in body, (
-        "Expected ``arith.maxsi`` for signed vmax.\n"
-        f"Body:\n{body}"
-    )
-    assert "arith.maximumf" not in body, (
-        "Signed vmax should not emit ``arith.maxf``.\n"
-        f"Body:\n{body}"
+    op_text = _extract_vmax_op(source)
+    assert 'dtype = "int32"' in op_text, (
+        f"Expected dtype = \"int32\".\nOp text:\n{op_text}"
     )
 
 
-def test_vmax_different_values():
-    """Different input values must produce the same structure."""
+def test_vmax_no_linalg_generic():
+    """vmax must no longer lower to linalg.generic."""
     source = _lower_to_tile_source(_vmax_kernel())
-    assert "linalg.generic" in source
+    assert "linalg.generic" not in source
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from .simd import (  # noqa: F401
     vmuls,
     vreduce_max,
     vreduce_sum,
+    vsub,
 )
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401

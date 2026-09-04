@@ -123,6 +123,11 @@ def vmul(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExp
     return _binary_vector_op("vmul", src0, src1, dst)
 
 
+def vsub(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExpr:
+    """Subtract two vector regions and write the result to a vector region."""
+    return _binary_vector_op("vsub", src0, src1, dst)
+
+
 def vmax(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExpr:
     """Take the elementwise maximum and write it to a vector region."""
     return _binary_vector_op("vmax", src0, src1, dst)

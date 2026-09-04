@@ -1,10 +1,10 @@
 """TileLangIR ``tl.tileop.vmuls`` codegen tests.
 
-Verifies that ``T.vmuls`` in the DSL lowers to a ``linalg.generic`` op with
-the scalar captured as an SSA value from the parent scope (no extra memref
-alloc for the scalar). These are pure IR codegen tests: they call
+Verifies that ``T.vmuls`` in the DSL lowers to a ``tilelang.vmuls`` custom
+dialect op with the scalar captured as an explicit SSA operand (no extra memref
+alloc for the scalar).  These are pure IR codegen tests: they call
 ``tilelang.lower(..., target="tile")`` and assert on the generated MLIR source
-string. No Ascend hardware required.
+string.  No Ascend hardware required.
 """
 
 import re
@@ -15,6 +15,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 
+
 def _vmuls_kernel(
     M: int = 1024,
     N: int = 256,
@@ -23,14 +24,7 @@ def _vmuls_kernel(
     dtype: str = "float32",
     dst_dtype: str = None,
 ):
-    """Build a minimal vmuls kernel ``C = A * scalar`` (one block per row-tile).
-
-    Only the ``T.vmuls`` call is exercised; the surrounding ``T.copy`` ops are
-    intentionally left in place so the TIRX IR shape matches a realistic kernel.
-
-    ``dtype`` sets the source dtype; ``dst_dtype`` (defaults to ``dtype``) sets
-    the destination dtype, allowing src/dst mismatch scenarios for validation.
-    """
+    """Build a minimal vmuls kernel ``C = A * scalar``."""
     num_blocks = M // block_M
     dst_dtype = dst_dtype or dtype
     VL = 64
@@ -61,6 +55,7 @@ def _vmuls_kernel(
 
     return main
 
+
 def _lower_to_tile_source(kernel):
     """Lower ``kernel`` to tile target and return the generated MLIR source."""
     from tilelang import lower as _lower
@@ -68,35 +63,32 @@ def _lower_to_tile_source(kernel):
     artifact = _lower(kernel, target="tile")
     return artifact.kernel_source
 
-# Regex that matches a ``linalg.generic`` op and captures its full content.
-_LINALG_GENERIC_RE = re.compile(
-    r"linalg\.generic\s*\{[^}]*\}\s*ins\([^)]*\)\s*outs\([^)]*\)\s*\{[^}]*\}",
-    re.MULTILINE | re.DOTALL,
-)
 
-def _assert_linalg_generic(source: str) -> re.Match:
-    """Assert that the source contains at least one ``linalg.generic`` op."""
-    match = _LINALG_GENERIC_RE.search(source)
+def _extract_vmuls_op(source: str) -> str:
+    """Return the ``tilelang.vmuls`` operation emitted for ``T.vmuls``."""
+    match = re.search(r'"tilelang\.vmuls"\([^)]*\)[^{]*:[^)]*\)', source)
     assert match is not None, (
-        "Expected a ``linalg.generic`` op in the generated MLIR, but none was found.\n"
-        f"Source:\n{source}"
+        "Expected a ``tilelang.vmuls`` op in the generated MLIR, but none was "
+        f"found.\nSource:\n{source}"
     )
-    return match
+    return match.group(0)
 
-def test_vmuls_basic_lowers_to_linalg_generic():
-    """C = A * scalar must emit at least one ``linalg.generic``."""
+
+def test_vmuls_basic_lowers_to_tilelang_vmuls():
+    """C = A * scalar must emit at least one ``tilelang.vmuls``."""
     source = _lower_to_tile_source(_vmuls_kernel())
-    _assert_linalg_generic(source)
+    assert "tilelang.vmuls" in source
+    assert "linalg.generic" not in source
+
 
 def test_vmuls_operand_has_fragment_address_space():
-    """Both ``ins`` and ``outs`` memrefs should live in address space 2 (fragment)."""
+    """The src/dst memrefs should live in address space 2 (fragment)."""
     source = _lower_to_tile_source(_vmuls_kernel())
-    match = _assert_linalg_generic(source)
-    op_text = match.group(0)
-    # Fragment buffers have address space 2 in the MLIR output.
-    assert "memref<64xf32, strided<[1]>, 2>" in op_text, (
+    op_text = _extract_vmuls_op(source)
+    assert "memref<64xf32, 2>" in op_text, (
         f"Expected fragment memref with address space 2, got:\n{op_text}"
     )
+
 
 def test_vmuls_scalar_constant_is_present():
     """The scalar constant (e.g. 2.0) must appear as an ``arith.constant``."""
@@ -106,44 +98,6 @@ def test_vmuls_scalar_constant_is_present():
         f"Source:\n{source}"
     )
 
-def test_vmuls_body_has_arith_mulf():
-    """The ``linalg.generic`` body must contain ``arith.mulf``."""
-    source = _lower_to_tile_source(_vmuls_kernel())
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    assert "arith.mulf" in body, (
-        "Expected ``arith.mulf`` in the linalg.generic body.\n"
-        f"Body:\n{body}"
-    )
-
-def test_vmuls_body_yields_mulf_result():
-    """The ``linalg.generic`` body must contain ``linalg.yield`` with the mulf result."""
-    source = _lower_to_tile_source(_vmuls_kernel())
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    # The yield should follow the mulf within the body.
-    yield_match = re.search(r"linalg\.yield\s+%[^:\s]+", body)
-    assert yield_match is not None, (
-        "Expected ``linalg.yield`` with the mulf result in the generic body.\n"
-        f"Body:\n{body}"
-    )
-
-def test_vmuls_indexing_maps_are_identity():
-    """The ``indexing_maps`` should be ``#map = affine_map<(d0) -> (d0)>``."""
-    source = _lower_to_tile_source(_vmuls_kernel())
-    # The identity affine map for 1D: (d0) -> (d0)
-    assert "affine_map<(d0) -> (d0)>" in source, (
-        "Expected identity affine map in the generated MLIR.\n"
-        f"Source:\n{source}"
-    )
-
-def test_vmuls_iterator_types_are_parallel():
-    """The ``iterator_types`` should be ``[\"parallel\"]``."""
-    source = _lower_to_tile_source(_vmuls_kernel())
-    assert 'iterator_types = ["parallel"]' in source, (
-        "Expected iterator_types = [\"parallel\"] in linalg.generic.\n"
-        f"Source:\n{source}"
-    )
 
 def test_vmuls_different_scalar_values():
     """Different scalar values must produce different constants in the MLIR."""
@@ -153,24 +107,47 @@ def test_vmuls_different_scalar_values():
     source_3 = _lower_to_tile_source(_vmuls_kernel(scalar_val=3.0))
     assert "arith.constant 3.000000e+00 : f32" in source_3
 
-def test_vmuls_integer_dtype_uses_muli():
-    """Integer vmuls must emit ``arith.muli`` (not ``arith.mulf``) in the body."""
+
+def test_vmuls_integer_dtype():
+    """Integer vmuls must still lower to a ``tilelang.vmuls`` op."""
     source = _lower_to_tile_source(_vmuls_kernel(dtype="int32", scalar_val=2))
-    match = _assert_linalg_generic(source)
-    body = match.group(0)
-    assert "arith.muli" in body, (
-        "Expected ``arith.muli`` for integer vmuls.\n"
-        f"Body:\n{body}"
-    )
-    assert "arith.mulf" not in body, (
-        "Integer vmuls should not emit ``arith.mulf``.\n"
-        f"Body:\n{body}"
-    )
+    assert "tilelang.vmuls" in source
+
 
 def test_vmuls_mismatched_dtype_raises():
     """src/dst with different dtypes must raise TypeError."""
     with pytest.raises(TypeError):
         _lower_to_tile_source(_vmuls_kernel(dtype="float32", dst_dtype="float16"))
+
+
+def _vmuls_2d_kernel(
+    M: int = 128,
+    N: int = 128,
+    scalar_val: float = 2.0,
+    dtype: str = "float32",
+):
+    """Build a rank-2 vmuls kernel ``C = A * scalar`` over a (M, N) fragment."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1), T.SimdVF():
+            a_frag = T.alloc_frag((M, N), dtype)
+            c_frag = T.alloc_frag((M, N), dtype)
+            T.copy(A[0:M, 0:N], a_frag)
+            T.vmuls(a_frag, scalar_val, c_frag)
+            T.copy(c_frag, C[0:M, 0:N])
+
+    return main
+
+
+def test_vmuls_2d_lowers_to_tilelang_vmuls():
+    """A rank-2 vmuls must emit a ``tilelang.vmuls`` op."""
+    source = _lower_to_tile_source(_vmuls_2d_kernel())
+    assert "tilelang.vmuls" in source
+
 
 if __name__ == "__main__":
     tilelang.testing.main()

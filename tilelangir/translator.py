@@ -10,7 +10,16 @@ from tvm import IRModule, tirx
 from tvm.tirx import PrimFunc, PyStmtExprVisitor
 
 from .dialect import configure_context
-from ._tilelang_ops_gen import CopyOp, GemmOp, ScopeOp
+from ._tilelang_ops_gen import (
+    CopyOp,
+    GemmOp,
+    ScopeOp,
+    VcvtOp,
+    VexpdifOp,
+    VmaxOp,
+    VmulsOp,
+    VsubOp,
+)
 
 
 @tirx.functor.visitor
@@ -30,7 +39,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._ir: Any = None
         self._func: Any = None
         self._linalg: Any = None
-        self._math: Any = None
         self._memref: Any = None
         self._scf: Any = None
         self._execution_scope_modes: list[str] = []
@@ -45,7 +53,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         # 2. Load and validate the MLIR Python bindings
         try:
             from mlir import ir
-            from mlir.dialects import arith, func, linalg, math, memref, scf
+            from mlir.dialects import arith, func, linalg, memref, scf
         except ImportError as exc:
             raise ImportError(
                 "TileLangIR codegen requires LLVM's official MLIR Python bindings. "
@@ -57,7 +65,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._ir = ir
         self._func = func
         self._linalg = linalg
-        self._math = math
         self._memref = memref
         self._scf = scf
 
@@ -85,7 +92,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 self._ir = None
                 self._func = None
                 self._linalg = None
-                self._math = None
                 self._memref = None
                 self._scf = None
                 self._execution_scope_modes.clear()
@@ -342,7 +348,18 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"{len(raw_extents)} extents for rank-{len(buffer_strides)} Buffer."
             )
         region_strides = buffer_strides[-len(raw_extents) :]
-        sizes, strides = self._squeeze_unit_dims(raw_extents, region_strides)
+        if str(buffer.scope()) == "local.fragment":
+            # Fragment regions must keep their unit dims. Squeezing a (1,)
+            # fragment region down to rank-0 makes its reaching-def vector rank
+            # inconsistent with the fragment's other producers (vmax/vreduce),
+            # which breaks the vexpdif RHS type check.
+            sizes = [
+                self._static_int(extent, f"{buffer.name} extent")
+                for extent in raw_extents
+            ]
+            strides = region_strides
+        else:
+            sizes, strides = self._squeeze_unit_dims(raw_extents, region_strides)
 
         offset = self._emit_linear_offset(buffer, indices, buffer_strides)
         dynamic = self._ir.ShapedType.get_dynamic_size()
@@ -424,6 +441,14 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.mul(src0, src1, outs=[dst])
+
+    def _emit_vsub(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(f"tl.tileop.vsub expects 3 arguments, but received {len(call.args)}")
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+        VsubOp(src0, src1, dst)
 
     def _emit_vreduce_max(self, call: tirx.Call) -> None:
         if len(call.args) < 2:
@@ -629,38 +654,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             return str(arg.dtype)
         return "float32"
 
-    def _elementwise_indexing_maps(self, inputs: list[Any], dst: Any) -> Any:
-        """Build indexing maps for same-shape and scalar-broadcast operands.
-
-        The output defines the elementwise iteration space. An input with the
-        same shape uses the identity map, while a rank-zero input uses an empty
-        result map and is therefore broadcast across that iteration space.
-        Other shape relationships are intentionally left for the general
-        elementwise broadcasting work.
-        """
-        dst_type = self._ir.MemRefType(dst.type)
-        rank = dst_type.rank
-        dimensions = [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
-        identity = self._ir.AffineMap.get(rank, 0, dimensions)
-        scalar = self._ir.AffineMap.get(rank, 0, [])
-
-        maps = []
-        for operand in inputs:
-            operand_type = self._ir.MemRefType(operand.type)
-            if tuple(operand_type.shape) == tuple(dst_type.shape):
-                operand_map = identity
-            elif operand_type.rank == 0:
-                operand_map = scalar
-            else:
-                raise ValueError(
-                    "Unsupported elementwise shape relationship: "
-                    f"input {operand_type.shape}, output {dst_type.shape}"
-                )
-            maps.append(self._ir.AffineMapAttr.get(operand_map))
-
-        maps.append(self._ir.AffineMapAttr.get(identity))
-        return self._ir.ArrayAttr.get(maps)
-
     def _emit_vexpdif(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(
@@ -669,33 +662,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src0 = self._get_or_create_expr_value(call.args[0])
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
-
-        src0_type = self._ir.MemRefType(src0.type)
-        src1_type = self._ir.MemRefType(src1.type)
-        dst_type = self._ir.MemRefType(dst.type)
-        rank = dst_type.rank
-        element_type = dst_type.element_type
-
-        indexing_maps = self._elementwise_indexing_maps([src0, src1], dst)
-        iterator_types = self._ir.ArrayAttr.get(
-            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
-        )
-        generic = self._linalg.GenericOp(
-            result_tensors=[],
-            inputs=[src0, src1],
-            outputs=[dst],
-            indexing_maps=indexing_maps,
-            iterator_types=iterator_types,
-        )
-        block = generic.regions[0].blocks.append(
-            src0_type.element_type,
-            src1_type.element_type,
-            element_type,
-        )
-        with self._ir.InsertionPoint(block):
-            diff = self._arith.SubFOp(block.arguments[0], block.arguments[1]).result
-            result = self._math.ExpOp(diff).result
-            self._linalg.YieldOp([result])
+        VexpdifOp(src0, src1, dst)
 
     def _emit_copy(self, call: tirx.Call) -> None:
         if len(call.args) < 2:
@@ -742,36 +709,10 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dtype_arg = call.args[2]
         src = self._get_or_create_expr_value(call.args[0])
         dst = self._get_or_create_expr_value(call.args[1])
-        src_type = src.type
-        dst_type = dst.type
-
-        src_element = src_type.element_type
-        dst_element = dst_type.element_type
-        rank = dst_type.rank
-
-        indexing_map = self._ir.AffineMap.get(
-            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
-        )
-        indexing_maps = self._ir.ArrayAttr.get(
-            [self._ir.AffineMapAttr.get(indexing_map)] * 2
-        )
-        iterator_types = self._ir.ArrayAttr.get(
-            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
-        )
-        generic = self._linalg.GenericOp(
-            result_tensors=[],
-            inputs=[src],
-            outputs=[dst],
-            indexing_maps=indexing_maps,
-            iterator_types=iterator_types,
-        )
-        block = generic.regions[0].blocks.append(src_element, dst_element)
-        with self._ir.InsertionPoint(block):
-            src_dtype_name = self._region_dtype_name(call.args[0])
-            result = self._build_arith_cast(
-                block.arguments[0], dst_element, dtype_arg.value, src_dtype_name
-            )
-            self._linalg.YieldOp([result])
+        src_dtype = self._region_dtype_name(call.args[0])
+        if src_dtype is None:
+            src_dtype = str(src.type.element_type)
+        VcvtOp(src, dst, src_dtype=src_dtype, dst_dtype=dtype_arg.value)
 
     @staticmethod
     def _region_dtype_name(region_call: Any) -> str | None:
@@ -784,68 +725,6 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             return str(buffer_load.buffer.dtype)
         except (AttributeError, IndexError):
             return None
-
-    def _build_arith_cast(
-        self,
-        value: Any,
-        dst_type: Any,
-        dst_dtype_name: str,
-        src_dtype_name: str | None = None,
-    ) -> Any:
-        src_type = value.type
-        if src_type == dst_type:
-            return value
-
-        dst_is_unsigned = dst_dtype_name.startswith("uint")
-        src_is_unsigned = src_dtype_name is not None and src_dtype_name.startswith("uint")
-
-        if isinstance(src_type, self._ir.FloatType):
-            if isinstance(dst_type, self._ir.FloatType):
-                # float -> float: narrow / widen / reinterpret by bit-width.
-                src_width = int(src_type.width)
-                dst_width = int(dst_type.width)
-                if src_width > dst_width:
-                    return self._arith.TruncFOp(dst_type, value).result
-                elif src_width < dst_width:
-                    return self._arith.ExtFOp(dst_type, value).result
-                else:
-                    # Same bit-width but different float types (e.g. bf16 <-> f16):
-                    # arith has no direct cast, so round-trip through a wider type.
-                    wider = (
-                        self._ir.F64Type.get()
-                        if src_width >= 32
-                        else self._ir.F32Type.get()
-                    )
-                    extended = self._arith.ExtFOp(wider, value).result
-                    return self._arith.TruncFOp(dst_type, extended).result
-            else:
-                # float -> int: signed/unsigned decided by destination dtype name.
-                if dst_is_unsigned:
-                    return self._arith.FPToUIOp(dst_type, value).result
-                else:
-                    return self._arith.FPToSIOp(dst_type, value).result
-        else:
-            if isinstance(dst_type, self._ir.FloatType):
-                # int -> float: signed/unsigned decided by source dtype name.
-                if src_is_unsigned:
-                    return self._arith.UIToFPOp(dst_type, value).result
-                else:
-                    return self._arith.SIToFPOp(dst_type, value).result
-            else:
-                # int -> int: narrow / extend / reinterpret by bit-width.
-                src_width = int(src_type.width)
-                dst_width = int(dst_type.width)
-                if src_width > dst_width:
-                    return self._arith.TruncIOp(dst_type, value).result
-                elif src_width < dst_width:
-                    if src_is_unsigned:
-                        return self._arith.ExtUIOp(dst_type, value).result
-                    else:
-                        return self._arith.ExtSIOp(dst_type, value).result
-                else:
-                    raise AssertionError(
-                        f"unreachable int->int same-width cast: {src_type} -> {dst_type}"
-                    )
 
     def _emit_vmuls(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
@@ -864,31 +743,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"tl.tileop.vmuls expects src, scalar, and dst to have the same dtype, "
                 f"but received {src_type}, {scalar_type}, and {dst_type}"
             )
-        element_type = src_type
-        identity = self._ir.AffineMap.get_identity(1)
-        indexing_maps = self._ir.ArrayAttr.get([
-            self._ir.AffineMapAttr.get(identity),
-            self._ir.AffineMapAttr.get(identity),
-        ])
-        iterator_types = [self._ir.StringAttr.get("parallel")]
-        generic = self._linalg.GenericOp(
-            [],
-            [src],
-            [dst],
-            indexing_maps,
-            iterator_types
-        )
-        body_region = generic.regions[0]
-        block = self._ir.Block.create_at_start(
-            body_region,
-            [element_type, element_type]
-        )
-        with self._arith.InsertionPoint(block):
-            if isinstance(element_type, self._ir.FloatType):
-                mul = self._arith.MulFOp(block.arguments[0], scalar)
-            else:
-                mul = self._arith.MulIOp(block.arguments[0], scalar)
-            self._linalg.YieldOp([mul.result])
+        VmulsOp(src, scalar, dst)
 
     def _emit_if_then_else(self, call: tirx.Call) -> Any:
         """Lower the ``tirx.if_then_else`` expression into ``arith.select``.
@@ -932,47 +787,12 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
 
-        dst_type = dst.type
-        rank = dst_type.rank
-        element_type = dst_type.element_type
-
         # 无符号信息仅在 TIRX 层保留（_dtype_type 把 int/uint 都压成 signless）。
         # 从 tl.tileop.region Call 解包出 BufferLoad，读取原始 TIRX dtype。
-        tirx_dtype = None
-        arg0 = call.args[0]
-        if (
-            isinstance(arg0, tirx.Call)
-            and arg0.op.name == "tl.tileop.region"
-            and isinstance(arg0.args[0], tirx.BufferLoad)
-        ):
-            tirx_dtype = str(arg0.args[0].buffer.dtype)
-
-        indexing_map = self._ir.AffineMap.get(
-            rank, 0, [self._ir.AffineExpr.get_dim(index) for index in range(rank)]
-        )
-        indexing_maps = self._ir.ArrayAttr.get(
-            [self._ir.AffineMapAttr.get(indexing_map)] * 3
-        )
-        iterator_types = self._ir.ArrayAttr.get(
-            [self._ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
-        )
-        generic = self._linalg.GenericOp(
-            result_tensors=[],
-            inputs=[src0, src1],
-            outputs=[dst],
-            indexing_maps=indexing_maps,
-            iterator_types=iterator_types,
-        )
-        block = generic.regions[0].blocks.append(element_type, element_type, element_type)
-        with self._ir.InsertionPoint(block):
-            # 按 dtype 选择 max op：浮点用 maximumf，无符号整型用 maxui，有符号/其余用 maxsi。
-            if isinstance(element_type, self._ir.FloatType):
-                max_op = self._arith.MaximumFOp(block.arguments[0], block.arguments[1])
-            elif tirx_dtype is not None and tirx_dtype.startswith("uint"):
-                max_op = self._arith.MaxUIOp(block.arguments[0], block.arguments[1])
-            else:
-                max_op = self._arith.MaxSIOp(block.arguments[0], block.arguments[1])
-            self._linalg.YieldOp([max_op.result])
+        tirx_dtype = self._region_dtype_name(call.args[0])
+        if tirx_dtype is None:
+            tirx_dtype = str(dst.type.element_type)
+        VmaxOp(src0, src1, dst, dtype=tirx_dtype)
 
     def _cast_to_index(self, value: Any) -> Any:
         index_type = self._ir.IndexType.get()
@@ -1570,6 +1390,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_vadd(op)
         elif op_name == "tl.tileop.vmul":
             self._emit_vmul(op)
+        elif op_name == "tl.tileop.vsub":
+            self._emit_vsub(op)
         elif op_name == "tl.tileop.vreduce_max":
             self._emit_vreduce_max(op)
         elif op_name == "tl.tileop.vreduce_sum":

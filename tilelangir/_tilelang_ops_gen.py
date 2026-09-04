@@ -306,3 +306,299 @@ class ScopeYieldOp(_ods_ir.OpView):
             loc=loc,
             ip=ip,
         )
+
+
+# ===========================================================================
+# tilelang.vcvt
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class VcvtOp(_ods_ir.OpView):
+    """Elementwise type conversion between two memref SSA values.
+
+    ``src_dtype``/``dst_dtype`` preserve the frontend TIRX dtype names (e.g.
+    ``"uint8"``/``"float32"``) whose signedness is lost in signless memref
+    element types. The backend reconstructs the cast ``type_fn`` from them.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.vcvt"(%src, %dst) {src_dtype = "float32", dst_dtype = "float16"}
+            : (memref<...>, memref<...>) -> ()
+    """
+
+    OPERATION_NAME = "tilelang.vcvt"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        src,
+        dst,
+        *,
+        src_dtype: str,
+        dst_dtype: str,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={
+                "src_dtype": _ods_ir.StringAttr.get(src_dtype),
+                "dst_dtype": _ods_ir.StringAttr.get(dst_dtype),
+            },
+            results=[],
+            operands=[src, dst],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )
+
+    @builtins.property
+    def src(self):
+        return self.operation.operands[0]
+
+    @builtins.property
+    def dst(self):
+        return self.operation.operands[1]
+
+    @builtins.property
+    def src_dtype(self) -> str:
+        return _ods_ir.StringAttr(self.operation.attributes["src_dtype"]).value
+
+    @builtins.property
+    def dst_dtype(self) -> str:
+        return _ods_ir.StringAttr(self.operation.attributes["dst_dtype"]).value
+
+
+# ===========================================================================
+# tilelang.vexpdif
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class VexpdifOp(_ods_ir.OpView):
+    """Elementwise ``exp(src0 - src1)`` on three memref SSA values.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.vexpdif"(%src0, %src1, %dst)
+            : (memref<...>, memref<...>, memref<...>) -> ()
+    """
+
+    OPERATION_NAME = "tilelang.vexpdif"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        src0,
+        src1,
+        dst,
+        *,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={},
+            results=[],
+            operands=[src0, src1, dst],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )
+
+    @builtins.property
+    def src0(self):
+        return self.operation.operands[0]
+
+    @builtins.property
+    def src1(self):
+        return self.operation.operands[1]
+
+    @builtins.property
+    def dst(self):
+        return self.operation.operands[2]
+
+
+# ===========================================================================
+# tilelang.vmuls
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class VmulsOp(_ods_ir.OpView):
+    """Elementwise ``src * scalar`` on a memref source and a scalar SSA value.
+
+    The scalar is an explicit operand rather than a region free variable.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.vmuls"(%src, %scalar, %dst)
+            : (memref<...>, f32, memref<...>) -> ()
+    """
+
+    OPERATION_NAME = "tilelang.vmuls"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        src,
+        scalar,
+        dst,
+        *,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={},
+            results=[],
+            operands=[src, scalar, dst],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )
+
+    @builtins.property
+    def src(self):
+        return self.operation.operands[0]
+
+    @builtins.property
+    def scalar(self):
+        return self.operation.operands[1]
+
+    @builtins.property
+    def dst(self):
+        return self.operation.operands[2]
+
+
+# ===========================================================================
+# tilelang.vmax
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class VmaxOp(_ods_ir.OpView):
+    """Elementwise maximum of two memref SSA values.
+
+    ``dtype`` preserves the frontend TIRX dtype name (e.g. ``"uint8"``,
+    ``"float32"``) so the backend can pick the right signedness.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.vmax"(%src0, %src1, %dst) {dtype = "float32"}
+            : (memref<...>, memref<...>, memref<...>) -> ()
+    """
+
+    OPERATION_NAME = "tilelang.vmax"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        src0,
+        src1,
+        dst,
+        *,
+        dtype: str,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={"dtype": _ods_ir.StringAttr.get(dtype)},
+            results=[],
+            operands=[src0, src1, dst],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )
+
+    @builtins.property
+    def src0(self):
+        return self.operation.operands[0]
+
+    @builtins.property
+    def src1(self):
+        return self.operation.operands[1]
+
+    @builtins.property
+    def dst(self):
+        return self.operation.operands[2]
+
+    @builtins.property
+    def dtype(self) -> str:
+        return _ods_ir.StringAttr(self.operation.attributes["dtype"]).value
+
+
+# ===========================================================================
+# tilelang.vsub
+# ===========================================================================
+
+@_ods_cext.register_operation(_Dialect)
+class VsubOp(_ods_ir.OpView):
+    """Elementwise subtraction of two memref SSA values.
+
+    Broadcast relationships are inferred from the operand memref shapes; the
+    backend inserts a ``npu.broadcast`` when a reaching vector definition has a
+    different shape than the destination fragment.
+
+    Assembly (unregistered dialect form)::
+
+        "tilelang.vsub"(%src0, %src1, %dst)
+            : (memref<...>, memref<...>, memref<...>) -> ()
+    """
+
+    OPERATION_NAME = "tilelang.vsub"
+
+    _ODS_REGIONS = (0, True)
+
+    def __init__(
+        self,
+        src0,
+        src1,
+        dst,
+        *,
+        loc: _Optional[_ods_ir.Location] = None,
+        ip: _Optional[_ods_ir.InsertionPoint] = None,
+    ):
+        super().__init__(
+            self.OPERATION_NAME,
+            self._ODS_REGIONS,
+            None,
+            None,
+            attributes={},
+            results=[],
+            operands=[src0, src1, dst],
+            successors=None,
+            regions=None,
+            loc=loc,
+            ip=ip,
+        )
+
+    @builtins.property
+    def src0(self):
+        return self.operation.operands[0]
+
+    @builtins.property
+    def src1(self):
+        return self.operation.operands[1]
+
+    @builtins.property
+    def dst(self):
+        return self.operation.operands[2]
