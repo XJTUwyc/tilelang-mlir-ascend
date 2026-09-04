@@ -672,12 +672,34 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src = self._get_or_create_expr_value(call.args[0])
         dst = self._get_or_create_expr_value(call.args[1])
         ann = self._call_annotations(call)
+        split_dim = self._optional_int(ann.get("split_dim"))
+        if split_dim is not None:
+            # The NPU CopyOp verifier only accepts 0 (ROW) or 1 (COLUMN);
+            # reject every other value instead of guessing an auto split dim.
+            if split_dim not in (0, 1):
+                raise ValueError(
+                    f"split_dim must be 0 (ROW) or 1 (COLUMN), but got {split_dim}"
+                )
+            # The NPU CopyOp verifier requires static rank-2 memrefs for split
+            # copies.
+            self._require_rank2_memrefs(src, dst)
         CopyOp(
             src,
             dst,
-            split_dim=self._optional_int(ann.get("split_dim")),
+            split_dim=split_dim,
             transpose=True if self._as_bool(ann.get("transpose", False)) else None,
         )
+
+    def _require_rank2_memrefs(self, src: Any, dst: Any) -> None:
+        """Require rank-2 memrefs for split_dim copies."""
+        # TODO: only rank-2 memrefs are supported for now.
+        for value, name in ((src, "source"), (dst, "destination")):
+            rank = self._ir.MemRefType(value.type).rank
+            if rank != 2:
+                raise ValueError(
+                    f"split_dim copy requires rank-2 memrefs, but the {name} "
+                    f"operand has rank {rank}"
+                )
 
     def _emit_gemm(self, call: tirx.Call) -> None:
         # T.gemm Call arg layout (see tilelang/language/gemm_op.py):

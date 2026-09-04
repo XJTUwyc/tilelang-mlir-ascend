@@ -60,7 +60,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                 )
 
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, clear_accum=True)
-                T.copy(acc_s, S_ub, split_dim=-1)
+                T.copy(acc_s, S_ub, split_dim=0)
 
                 scale_ln2 = scale * 0.6931471805599453
                 ROWS = BR // 2
@@ -114,9 +114,9 @@ def flash_attention(D=128, SEQ_LEN=4096):
                         T.copy(m_new_frag, m_ub[r: r + 1])
                         T.copy(alpha_frag, alpha_ub[r: r + 1])
 
-                T.copy(P_ub, P_shared, split_dim=-1)
+                T.copy(P_ub, P_shared, split_dim=0)
                 T.gemm(P_shared, V_shared, acc_o, transpose_B=True, clear_accum=True)
-                T.copy(acc_o, O_tmp_ub, split_dim=-1)
+                T.copy(acc_o, O_tmp_ub, split_dim=0)
 
                 with T.SimdVF():
                     for i, j in T.Parallel(BR // 2, D):
@@ -126,7 +126,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                 for i, j in T.Parallel(BR // 2, D):
                     O_ub[i, j] = O_ub[i, j] / l_ub[i]
 
-            T.copy(O_ub, O[bx * BR : (bx + 1) * BR, 0:D], split_dim=-1)
+            T.copy(O_ub, O[bx * BR : (bx + 1) * BR, 0:D], split_dim=0)
 
     return main
 
