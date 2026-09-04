@@ -890,6 +890,22 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 mul = self._arith.MulIOp(block.arguments[0], scalar)
             self._linalg.YieldOp([mul.result])
 
+    def _emit_if_then_else(self, call: tirx.Call) -> Any:
+        """Lower the ``tirx.if_then_else`` expression into ``arith.select``.
+
+        TIRX enforces a Bool condition and identical branch dtypes, which is
+        exactly the contract of ``arith.select`` (see tvm/tirx/op/op.cc).
+        """
+        if len(call.args) != 3:
+            raise ValueError(
+                f"tirx.if_then_else expects 3 arguments, but received {len(call.args)}"
+            )
+        cond = self._get_or_create_expr_value(call.args[0])
+        true_value = self._get_or_create_expr_value(call.args[1])
+        false_value = self._get_or_create_expr_value(call.args[2])
+        result = self._arith.select(cond, true_value, false_value)
+        self._insert_value(call, result)
+        return result
     def _emit_vexp(self, call: tirx.Call) -> None:
         if len(call.args) != 2:
             raise ValueError(
@@ -1479,6 +1495,70 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         rhs = self._get_or_create_expr_value(op.b)
         self._insert_value(op, self._arith_binary_op(op.dtype, lhs, rhs, "DivSIOp", "DivFOp"))
 
+    def _emit_comparison(
+        self, op: tirx.PrimExpr, int_pred: str, float_pred: str
+    ) -> None:
+        """Lower a TIRX comparison (EQ/NE/LT/...) into arith.cmpi/cmpf.
+
+        The predicate kind follows the operand dtype: ``op.dtype`` is the
+        boolean result type, not the operand type, so floatness is decided
+        from ``op.a.dtype``.
+        """
+        lhs = self._get_or_create_expr_value(op.a)
+        rhs = self._get_or_create_expr_value(op.b)
+        operand_dtype = op.a.dtype
+        is_float = isinstance(self._dtype_type(operand_dtype), self._ir.FloatType)
+        if is_float:
+            predicate = getattr(self._arith.CmpFPredicate, float_pred)
+            result = self._arith.cmpf(predicate, lhs, rhs)
+        else:
+            lhs, rhs = self._unify_integer_operands(lhs, rhs)
+            predicate = getattr(self._arith.CmpIPredicate, int_pred)
+            result = self._arith.cmpi(predicate, lhs, rhs)
+        self._insert_value(op, result)
+
+    def visit_eq_(self, op: tirx.EQ) -> None:
+        self._emit_comparison(op, "eq", "OEQ")
+
+    def visit_ne_(self, op: tirx.NE) -> None:
+        self._emit_comparison(op, "ne", "UNE")
+
+    def visit_lt_(self, op: tirx.LT) -> None:
+        self._emit_comparison(op, "slt", "OLT")
+
+    def visit_le_(self, op: tirx.LE) -> None:
+        self._emit_comparison(op, "sle", "OLE")
+
+    def visit_gt_(self, op: tirx.GT) -> None:
+        self._emit_comparison(op, "sgt", "OGT")
+
+    def visit_ge_(self, op: tirx.GE) -> None:
+        self._emit_comparison(op, "sge", "OGE")
+
+    def visit_if_then_else_(self, op: tirx.IfThenElse) -> None:
+        """Lower a statement-level TIRX IfThenElse into ``scf.if``.
+
+        The condition must already lower to an i1 value (comparisons produce
+        i1 via arith.cmpi/cmpf). The then/else bodies are translated inside
+        fresh scoped value maps so region-local SSA values cannot escape
+        their non-dominating region.
+        """
+        cond = self._get_or_create_expr_value(op.condition)
+        if str(cond.type) != "i1":
+            raise NotImplementedError(
+                "Statement-level if condition must lower to an i1 value, got "
+                f"{cond.type}: {op.condition}"
+            )
+        has_else = op.else_case is not None
+        if_op = self._scf.IfOp(cond, has_else=has_else)
+        with self._ir.InsertionPoint(if_op.then_block), self._scoped_value_map():
+            self.visit_stmt(op.then_case)
+            self._scf.YieldOp([])
+        if has_else:
+            with self._ir.InsertionPoint(if_op.else_block), self._scoped_value_map():
+                self.visit_stmt(op.else_case)
+                self._scf.YieldOp([])
+
     # Add all handlers for native TIRX expressions here.
 
     # Operations registered under src/op are represented as Call nodes.
@@ -1500,6 +1580,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_copy(op)
         elif op_name == "tl.tileop.gemm":
             self._emit_gemm(op)
+        elif op_name == "tirx.if_then_else":
+            self._emit_if_then_else(op)
         elif op_name == "tl.tileop.vexp":
             self._emit_vexp(op)
         elif op_name == "tl.tileop.vmax":
