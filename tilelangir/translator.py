@@ -442,6 +442,30 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         dst = self._get_or_create_expr_value(call.args[2])
         self._linalg.mul(src0, src1, outs=[dst])
 
+    def _emit_vdiv(self, call: tirx.Call) -> None:
+        if len(call.args) != 3:
+            raise ValueError(f"tl.tileop.vdiv expects 3 arguments, but received {len(call.args)}")
+        src0 = self._get_or_create_expr_value(call.args[0])
+        src1 = self._get_or_create_expr_value(call.args[1])
+        dst = self._get_or_create_expr_value(call.args[2])
+        src0_type = self._ir.MemRefType(src0.type)
+        src1_type = self._ir.MemRefType(src1.type)
+        dst_type = self._ir.MemRefType(dst.type)
+
+        # 判断是否需要广播：src1 rank < dst rank（仿 _emit_vsub）
+        if src1_type.rank < dst_type.rank:
+            broadcasted_src1 = self._memref.AllocOp(dst_type, [], []).result
+            rank_diff = dst_type.rank - src1_type.rank
+            broadcast_dims = list(range(dst_type.rank - rank_diff, dst_type.rank))
+            self._linalg.broadcast(
+                src1,
+                outs=[broadcasted_src1],
+                dimensions=broadcast_dims,
+            )
+            self._linalg.div(src0, broadcasted_src1, outs=[dst])
+        else:
+            self._linalg.div(src0, src1, outs=[dst])
+
     def _emit_vsub(self, call: tirx.Call) -> None:
         if len(call.args) != 3:
             raise ValueError(f"tl.tileop.vsub expects 3 arguments, but received {len(call.args)}")
@@ -1412,6 +1436,8 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._emit_vadd(op)
         elif op_name == "tl.tileop.vmul":
             self._emit_vmul(op)
+        elif op_name == "tl.tileop.vdiv":
+            self._emit_vdiv(op)
         elif op_name == "tl.tileop.vsub":
             self._emit_vsub(op)
         elif op_name == "tl.tileop.vreduce_max":

@@ -128,6 +128,11 @@ def vsub(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExp
     return _binary_vector_op("vsub", src0, src1, dst)
 
 
+def vdiv(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExpr:
+    """Divide two vector regions elementwise and write the result to a vector region."""
+    return _binary_vector_op("vdiv", src0, src1, dst)
+
+
 def vmax(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExpr:
     """Take the elementwise maximum and write it to a vector region."""
     return _binary_vector_op("vmax", src0, src1, dst)

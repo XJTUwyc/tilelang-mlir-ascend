@@ -3,6 +3,7 @@
 from .vector import (
     vadd,
     vcvt,
+    vdiv,
     vexp,
     vexpdif,
     vmax,
@@ -16,6 +17,7 @@ from .vector import (
 __all__ = [
     "vadd",
     "vcvt",
+    "vdiv",
     "vexp",
     "vexpdif",
     "vmax",

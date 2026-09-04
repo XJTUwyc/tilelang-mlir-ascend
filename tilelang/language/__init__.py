@@ -30,6 +30,7 @@ from .scope import SimdVF, SimtVF  # noqa: F401
 from .simd import (  # noqa: F401
     vadd,
     vcvt,
+    vdiv,
     vexp,
     vexpdif,
     vmax,
