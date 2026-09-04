@@ -73,16 +73,34 @@ def _binary_vector_op(
     )
 
 
+def _normalize_reduce_dims(dim) -> list[int]:
+    """Normalize a ``dim`` argument into a list of ints (negative kept for the translator)."""
+    if isinstance(dim, int):
+        dims = [dim]
+    elif isinstance(dim, (tuple, list)):
+        dims = [int(d) for d in dim]
+    else:
+        raise TypeError(f"Unsupported dim type: {type(dim).__name__}, expected int or sequence of int")
+    if len(dims) == 0:
+        raise ValueError("dim must not be empty")
+    return dims
+
+
 def _reduce_vector_op(
     op_name: str,
     src: OperandType,
     dst: OperandType,
+    dim: int | tuple[int, ...] | list[int] | None = None,
 ) -> tirx.PrimExpr:
-    return _call_vector_op(
-        op_name,
+    # Validate dim before touching the operands so bad dim values report
+    # the dim error rather than an operand error.
+    dims = _normalize_reduce_dims(dim) if dim is not None else []
+    args = [
         _normalize_operand(src, access_type="r"),
         _normalize_operand(dst, access_type="w"),
-    )
+    ]
+    args.extend(tirx.const(d, "int64") for d in dims)
+    return _call_vector_op(op_name, *args)
 
 
 def vmuls(src: OperandType, scalar: PyPrimExpr, dst: OperandType) -> tirx.PrimExpr:
@@ -110,14 +128,32 @@ def vmax(src0: OperandType, src1: OperandType, dst: OperandType) -> tirx.PrimExp
     return _binary_vector_op("vmax", src0, src1, dst)
 
 
-def vreduce_max(src: OperandType, dst: OperandType) -> tirx.PrimExpr:
-    """Reduce a vector region by maximum into a destination region."""
-    return _reduce_vector_op("vreduce_max", src, dst)
+def vreduce_max(
+    src: OperandType,
+    dst: OperandType,
+    dim: int | tuple[int, ...] | list[int] | None = None,
+) -> tirx.PrimExpr:
+    """Reduce a vector region by maximum into a destination region.
+
+    ``dim`` names the reduced (eliminated) source dimensions.  Negative indices
+    follow Python semantics.  When omitted the dimensions are inferred by
+    comparing the source and destination shapes.
+    """
+    return _reduce_vector_op("vreduce_max", src, dst, dim)
 
 
-def vreduce_sum(src: OperandType, dst: OperandType) -> tirx.PrimExpr:
-    """Reduce a vector region by summation into a destination region."""
-    return _reduce_vector_op("vreduce_sum", src, dst)
+def vreduce_sum(
+    src: OperandType,
+    dst: OperandType,
+    dim: int | tuple[int, ...] | list[int] | None = None,
+) -> tirx.PrimExpr:
+    """Reduce a vector region by summation into a destination region.
+
+    ``dim`` names the reduced (eliminated) source dimensions.  Negative indices
+    follow Python semantics.  When omitted the dimensions are inferred by
+    comparing the source and destination shapes.
+    """
+    return _reduce_vector_op("vreduce_sum", src, dst, dim)
 
 
 def vexp(src: OperandType, dst: OperandType) -> tirx.PrimExpr:

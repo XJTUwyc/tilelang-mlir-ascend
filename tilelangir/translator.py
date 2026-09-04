@@ -426,22 +426,49 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._linalg.mul(src0, src1, outs=[dst])
 
     def _emit_vreduce_max(self, call: tirx.Call) -> None:
-        if len(call.args) != 2:
-            raise ValueError(f"tl.tileop.vreduce_max expects 2 arguments, but received {len(call.args)}")
+        if len(call.args) < 2:
+            raise ValueError(
+                f"tl.tileop.vreduce_max expects at least 2 arguments, but received {len(call.args)}"
+            )
         src = self._get_or_create_expr_value(call.args[0])
         dst = self._get_or_create_expr_value(call.args[1])
         dtype_name = self._call_arg_dtype_name(call.args[0])
-        self._emit_linalg_reduce(src, dst, "maxf", dtype_name)
+        explicit_dims = self._explicit_reduce_dims(call.args[2:])
+        self._emit_linalg_reduce(src, dst, "maxf", dtype_name, explicit_dims)
 
     def _emit_vreduce_sum(self, call: tirx.Call) -> None:
-        if len(call.args) != 2:
-            raise ValueError(f"tl.tileop.vreduce_sum expects 2 arguments, but received {len(call.args)}")
+        if len(call.args) < 2:
+            raise ValueError(
+                f"tl.tileop.vreduce_sum expects at least 2 arguments, but received {len(call.args)}"
+            )
         src = self._get_or_create_expr_value(call.args[0])
         dst = self._get_or_create_expr_value(call.args[1])
         dtype_name = self._call_arg_dtype_name(call.args[0])
-        self._emit_linalg_reduce(src, dst, "addf", dtype_name)
+        explicit_dims = self._explicit_reduce_dims(call.args[2:])
+        self._emit_linalg_reduce(src, dst, "addf", dtype_name, explicit_dims)
 
-    def _emit_linalg_reduce(self, src: Any, dst: Any, kind: str, dtype_name: str) -> None:
+    @staticmethod
+    def _explicit_reduce_dims(args: list) -> list[int] | None:
+        """Parse trailing IntImm reduce-dim arguments; None when no dim was supplied."""
+        if len(args) == 0:
+            return None
+        dims: list[int] = []
+        for arg in args:
+            if not isinstance(arg, tirx.IntImm):
+                raise ValueError(
+                    f"Reduce dim arguments must be IntImm, but received {type(arg).__name__}"
+                )
+            dims.append(int(arg.value))
+        return dims
+
+    def _emit_linalg_reduce(
+        self,
+        src: Any,
+        dst: Any,
+        kind: str,
+        dtype_name: str,
+        explicit_dims: list[int] | None = None,
+    ) -> None:
         src_type = self._ir.MemRefType(src.type)
         dst_type = self._ir.MemRefType(dst.type)
         element_type = src_type.element_type
@@ -452,7 +479,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
         # Infer reduction dimensions by comparing src and dst shapes,
         # instead of hardcoding the last dimension.
-        reduce_dims = self._infer_reduce_dims(src_shape, dst_shape)
+        reduce_dims = self._resolve_reduce_dims(src_shape, dst_shape, explicit_dims)
 
         # Compute the expected init shape (src shape with reduce_dims removed).
         init_shape = [src_shape[i] for i in range(len(src_shape)) if i not in reduce_dims]
@@ -514,6 +541,31 @@ class TileLangIRTranslator(PyStmtExprVisitor):
             self._ir.Operation.create("linalg.yield", results=[], operands=[val])
 
     @staticmethod
+    def _resolve_reduce_dims(
+        src_shape: list[int], dst_shape: list[int], explicit_dims: list[int] | None
+    ) -> list[int]:
+        """Resolve reduction dims: explicit dims (negative normalized) or shape inference."""
+        if explicit_dims is None:
+            return TileLangIRTranslator._infer_reduce_dims(src_shape, dst_shape)
+
+        rank = len(src_shape)
+        dims = [d + rank if d < 0 else d for d in explicit_dims]
+        for d in dims:
+            if d < 0 or d >= rank:
+                raise ValueError(f"Reduce dim {d} is out of range for source rank {rank}")
+        if len(set(dims)) != len(dims):
+            raise ValueError(f"Duplicate reduce dims: {dims}")
+        dims.sort()
+
+        expected_shape = [src_shape[i] for i in range(rank) if i not in dims]
+        if expected_shape != dst_shape:
+            raise ValueError(
+                f"Reduce dims {dims} on source shape {src_shape} produce {expected_shape}, "
+                f"but destination shape is {dst_shape}"
+            )
+        return dims
+
+    @staticmethod
     def _infer_reduce_dims(
         src_shape: list[int], dst_shape: list[int]
     ) -> list[int]:
@@ -524,15 +576,16 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         if len(dst_shape) == len(src_shape):
             # Same rank: dims where sizes differ are the reduction dims.
             return [i for i in range(len(src_shape)) if src_shape[i] != dst_shape[i]]
-        # Different rank: match from right to left to find kept dims.
+        # Different rank: match from left to right to find kept dims.  The
+        # leading convention matches the broadcast convention (a row-reduced
+        # (BR, BC) region yields (BR,) and broadcasts back over columns).
         reduce_dims: list[int] = []
-        dst_idx = len(dst_shape) - 1
-        for src_idx in range(len(src_shape) - 1, -1, -1):
-            if dst_idx >= 0 and src_shape[src_idx] == dst_shape[dst_idx]:
-                dst_idx -= 1
+        dst_idx = 0
+        for src_idx in range(len(src_shape)):
+            if dst_idx < len(dst_shape) and src_shape[src_idx] == dst_shape[dst_idx]:
+                dst_idx += 1
             else:
                 reduce_dims.append(src_idx)
-        reduce_dims.reverse()
         return reduce_dims
 
     def _create_rank_reduced_view(
@@ -853,7 +906,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                 f"but received {src_type.shape} and {dst_type.shape}"
             )
         self._linalg.exp(src, outs=[dst])
-            
+
     def _emit_vmax(self, call: tirx.Call) -> None:
         if len(call.args) < 3:
             raise ValueError(
