@@ -178,20 +178,33 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         block_idx_bindings: list[tuple[Any, Any, str]],
         arg_base: int,
     ) -> None:
-        """Record which `func.func` argument carries `blockIdx.x`.
+        """Record which `func.func` arguments carry `blockIdx.x` / `blockIdx.y`.
 
-        Downstream reads the block index from a hardware instruction rather than
-        from the launch grid, so the attribute is a parameter position, not the
-        grid extent.
+        Each attribute is a parameter position; downstream replaces the
+        argument with npu.get_block_idx (cid) / npu.get_sub_block_idx (vid).
         """
-        for offset, (_var, _extent, tag) in enumerate(block_idx_bindings):
-            if tag != "blockIdx.x":
-                continue
+        for offset, (_var, extent, tag) in enumerate(block_idx_bindings):
             i64 = self._ir.IntegerType.get_signless(64)
-            function_op.attributes["BlockIdx"] = self._ir.IntegerAttr.get(
-                i64, arg_base + offset
-            )
-            return
+            if tag == "blockIdx.x":
+                function_op.attributes["BlockIdx"] = self._ir.IntegerAttr.get(
+                    i64, arg_base + offset
+                )
+            elif tag == "blockIdx.y":
+                # Second kernel axis is the 1:2 vec-core split (vid).
+                extent_value = self._static_int(extent, "blockIdx.y extent")
+                if extent_value != 2:
+                    raise ValueError(
+                        "blockIdx.y is the 1:2 vec-core split (vid), "
+                        f"so its extent must be 2, but got {extent_value}"
+                    )
+                function_op.attributes["SubBlockIdx"] = self._ir.IntegerAttr.get(
+                    i64, arg_base + offset
+                )
+            elif tag == "blockIdx.z":
+                raise ValueError(
+                    "The tile target supports at most two kernel axes: "
+                    "blockIdx.x (cid) and blockIdx.y (vid, extent 2)."
+                )
 
     def _emit_parameter_buffer(self, buffer: Any) -> Any:
         backing = self._get_value(buffer.data)
