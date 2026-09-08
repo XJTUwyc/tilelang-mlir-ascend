@@ -78,7 +78,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                     T.vreduce_max(S_frag, row_max_frag)
                     T.copy(row_max_frag, m_ub)   
 
-                with T.simdVF():
+                with T.SimdVF():
                     S_frag = T.alloc_frag((BR // 2, BC), accum_dtype)
                     P_frag = T.alloc_frag((BR // 2, BC), accum_dtype)
                     P_bf16_frag = T.alloc_frag((BR // 2, BC), dtype)
