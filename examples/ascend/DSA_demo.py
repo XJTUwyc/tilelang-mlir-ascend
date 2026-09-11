@@ -12,7 +12,11 @@ def dsa_demo(
     dim=256,
     top_k=128,
 ):
-    """Build a sparse-attention PrimFunc for the Ascend ``tile`` target."""
+    """Build a sparse-attention PrimFunc for the Ascend ``tile`` target.
+
+    The p_ub -> p_shared L1 copy is issued between the P-producing
+    scope and the row-sum reduce so it overlaps them on the MTE3 pipe.
+    """
 
     block_heads = num_heads
     half_heads = block_heads // 2  # heads per vector core (1:2 split)
@@ -49,6 +53,8 @@ def dsa_demo(
             # Dual-vec UB buffers: half-shape, private to each vector core.
             s_ub = T.alloc_shared((half_heads, block_top_k), accum_dtype)
             p_ub = T.alloc_shared((half_heads, block_top_k), dtype)
+            # fp32 P tile staged for the reduce scope below.
+            p_f32_ub = T.alloc_shared((half_heads, block_top_k), accum_dtype)
             o_ub = T.alloc_shared((half_heads, dim), accum_dtype)
             o_tmp_ub = T.alloc_shared((half_heads, dim), accum_dtype)
             m_ub = T.alloc_shared((half_heads,), accum_dtype)
@@ -133,7 +139,7 @@ def dsa_demo(
                     T.vreduce_max(s_frag, row_max_frag, dim=1)
                     T.copy(row_max_frag, m_ub)
 
-                # --- Step 2: P = exp(S - m_new) * valid, row sums ---
+                # --- Step 2a: P = exp(S - m_new) * valid ---
                 with T.SimdVF():
                     s_frag = T.alloc_frag((half_heads, block_top_k), accum_dtype)
                     p_frag = T.alloc_frag((half_heads, block_top_k), accum_dtype)
@@ -144,7 +150,6 @@ def dsa_demo(
                     m_new_bc = T.alloc_frag((half_heads, block_top_k), accum_dtype)
                     valid_frag = T.alloc_frag((block_top_k,), accum_dtype)
                     valid_bc = T.alloc_frag((half_heads, block_top_k), accum_dtype)
-                    row_sum_frag = T.alloc_frag((half_heads,), accum_dtype)
 
                     # Invalid KV rows have S = 0 exactly (zero-filled), and
                     # m_new >= 0, so exp(0 - m_new) <= 1 never overflows.
@@ -163,6 +168,17 @@ def dsa_demo(
 
                     T.vcvt(p_frag, p_bf16_frag, dtype)
                     T.copy(p_bf16_frag, p_ub)
+                    T.copy(p_frag, p_f32_ub)
+
+                # Early UB -> L1 delivery: overlaps the reduce below.
+                T.copy(p_ub, p_shared, split_dim=0)
+
+                # --- Step 2b: row sums ---
+                with T.SimdVF():
+                    p_frag = T.alloc_frag((half_heads, block_top_k), accum_dtype)
+                    row_sum_frag = T.alloc_frag((half_heads,), accum_dtype)
+
+                    T.copy(p_f32_ub, p_frag)
                     T.vreduce_sum(p_frag, row_sum_frag, dim=1)
                     T.copy(row_sum_frag, row_sum_ub)
 
@@ -185,9 +201,7 @@ def dsa_demo(
                     T.copy(l_frag, l_ub)
 
                 # --- O = O * alpha + P @ V ---
-                # UB -> L1: merge the two vec-core halves back into the
-                # full-head gemm A operand.
-                T.copy(p_ub, p_shared, split_dim=0)
+                # p_shared was already delivered after Step 2a.
                 T.gemm(
                     p_shared,
                     kv_shared,
