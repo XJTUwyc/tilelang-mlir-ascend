@@ -18,7 +18,6 @@ from ._tilelang_ops_gen import (
     VexpdifOp,
     VmaxOp,
     VmulsOp,
-    VsubOp,
 )
 
 
@@ -503,7 +502,23 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         src0 = self._get_or_create_expr_value(call.args[0])
         src1 = self._get_or_create_expr_value(call.args[1])
         dst = self._get_or_create_expr_value(call.args[2])
-        VsubOp(src0, src1, dst)
+        src0_type = self._ir.MemRefType(src0.type)
+        src1_type = self._ir.MemRefType(src1.type)
+        dst_type = self._ir.MemRefType(dst.type)
+
+        # 判断是否需要广播：src1 rank < dst rank（同 _emit_vdiv）
+        if src1_type.rank < dst_type.rank:
+            broadcasted_src1 = self._memref.AllocOp(dst_type, [], []).result
+            rank_diff = dst_type.rank - src1_type.rank
+            broadcast_dims = list(range(dst_type.rank - rank_diff, dst_type.rank))
+            self._linalg.broadcast(
+                src1,
+                outs=[broadcasted_src1],
+                dimensions=broadcast_dims,
+            )
+            self._linalg.sub(src0, broadcasted_src1, outs=[dst])
+        else:
+            self._linalg.sub(src0, src1, outs=[dst])
 
     def _emit_vreduce_max(self, call: tirx.Call) -> None:
         if len(call.args) < 2:
