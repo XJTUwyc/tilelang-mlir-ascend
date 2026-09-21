@@ -59,6 +59,17 @@ def fake_torch_npu(monkeypatch):
             CPU = "CPU"
             NPU = "NPU"
 
+        class ProfilerLevel:
+            Level1 = "Level1"
+
+        class AiCMetrics:
+            PipeUtilization = "PipeUtilization"
+
+        @staticmethod
+        def _ExperimentalConfig(**kwargs):
+            events.append(("experimental_config", kwargs))
+            return kwargs
+
         @staticmethod
         def schedule(**kwargs):
             events.append(("schedule", kwargs))
@@ -177,10 +188,29 @@ def test_npu_profiler_session_lifecycle(tmp_path, fake_torch_npu):
         "repeat": 1,
         "skip_first": 1,
     }
+
+    experimental_config = next(
+        event[1]
+        for event in fake_torch_npu
+        if event[0] == "experimental_config"
+    )
+    assert experimental_config == {
+        "profiler_level": "Level1",
+        "aic_metrics": "PipeUtilization",
+    }
+
+    profile_kwargs = next(
+        event[1]
+        for event in fake_torch_npu
+        if event[0] == "profile"
+    )
+    assert profile_kwargs["experimental_config"] is experimental_config
+
     _report(
         "session lifecycle",
         total_steps=session.total_steps,
         schedule=schedule,
+        experimental_config=experimental_config,
         events=lifecycle,
     )
 

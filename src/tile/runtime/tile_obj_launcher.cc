@@ -30,6 +30,10 @@
  *       float64 -> IEEE-754 bit pattern
  *   - stream is the raw NPU stream handle (0 = ACL default stream).
  */
+#ifdef TILELANG_CANN_PROFILER_AVAILABLE
+#include "tile_npu_profiler.h"
+#endif
+
 #include <dlfcn.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/error.h>
@@ -490,27 +494,35 @@ void LaunchTileObjectKernel(BoundKernelToken kernel_token, int64_t block_count,
   }
 
   AclError result;
-  size_t num_words = bound.pack_plan->buffer_size / sizeof(uint64_t);
-  if (num_words <= 4) {
-    result = PackAndLaunch<4>(driver, bound.function,
-                              static_cast<uint32_t>(block_count),
-                              reinterpret_cast<AclStream>(stream), config_ptr,
-                              *bound.pack_plan, args);
-  } else if (num_words <= 8) {
-    result = PackAndLaunch<8>(driver, bound.function,
-                              static_cast<uint32_t>(block_count),
-                              reinterpret_cast<AclStream>(stream), config_ptr,
-                              *bound.pack_plan, args);
-  } else if (num_words <= 16) {
-    result = PackAndLaunch<16>(driver, bound.function,
-                               static_cast<uint32_t>(block_count),
-                               reinterpret_cast<AclStream>(stream), config_ptr,
-                               *bound.pack_plan, args);
-  } else {
-    result = PackAndLaunch<0>(driver, bound.function,
-                              static_cast<uint32_t>(block_count),
-                              reinterpret_cast<AclStream>(stream), config_ptr,
-                              *bound.pack_plan, args);
+  {
+#ifdef TILELANG_CANN_PROFILER_AVAILABLE
+    NpuProfilerRange profiler_range(
+        bound.kernel_name->c_str(),
+        static_cast<uint32_t>(block_count), stream);
+#endif
+
+    size_t num_words = bound.pack_plan->buffer_size / sizeof(uint64_t);
+    if (num_words <= 4) {
+      result = PackAndLaunch<4>(driver, bound.function,
+                                static_cast<uint32_t>(block_count),
+                                reinterpret_cast<AclStream>(stream), config_ptr,
+                                *bound.pack_plan, args);
+    } else if (num_words <= 8) {
+      result = PackAndLaunch<8>(driver, bound.function,
+                                static_cast<uint32_t>(block_count),
+                                reinterpret_cast<AclStream>(stream), config_ptr,
+                                *bound.pack_plan, args);
+    } else if (num_words <= 16) {
+      result = PackAndLaunch<16>(driver, bound.function,
+                                 static_cast<uint32_t>(block_count),
+                                 reinterpret_cast<AclStream>(stream), config_ptr,
+                                 *bound.pack_plan, args);
+    } else {
+      result = PackAndLaunch<0>(driver, bound.function,
+                                static_cast<uint32_t>(block_count),
+                                reinterpret_cast<AclStream>(stream), config_ptr,
+                                *bound.pack_plan, args);
+    }
   }
   if (result != kAclSuccess) {
     const char *message = driver->GetRecentErrorMessage();

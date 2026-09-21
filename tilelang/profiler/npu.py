@@ -116,6 +116,11 @@ class NPUProfilerSession:
             analyse_flag=self.config.analyse,
         )
 
+        experimental_config = profiler._ExperimentalConfig(
+            profiler_level=profiler.ProfilerLevel.Level1,
+            aic_metrics=profiler.AiCMetrics.PipeUtilization,
+        )
+
         profiler_instance = profiler.profile(
             activities=[
                 profiler.ProfilerActivity.CPU,
@@ -126,6 +131,7 @@ class NPUProfilerSession:
             record_shapes=self.config.record_shapes,
             profile_memory=self.config.profile_memory,
             with_stack=self.config.with_stack,
+            experimental_config=experimental_config,
         )
 
         profiler_instance.start()
