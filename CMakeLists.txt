@@ -565,6 +565,12 @@ if(WIN32)
 else()
   add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
   target_link_libraries(tilelang PUBLIC tvm_compiler)
+  if(TILELANG_CANN_PROFILER_AVAILABLE)
+    target_link_libraries(
+      tilelang
+      PRIVATE ${TILELANG_CANN_PROFILER_LIBRARIES}
+    )
+  endif()
 
   # Place dev build outputs under build/lib for consistency
   set_target_properties(tilelang PROPERTIES
