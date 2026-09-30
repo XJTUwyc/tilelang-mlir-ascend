@@ -31,7 +31,7 @@ _dispatch_map: dict[str, KernelCache] = {
 
 def _resolve_cache_dispatch(
     target: TargetLike | None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "tile_obj"] | None,
     verbose: bool | None,
 ):
     if target is None:
@@ -59,6 +59,8 @@ def _resolve_cache_dispatch(
                 norm_target.kind.name,
                 ", ".join(sorted(allowed_now)),
             )
+    if resolved_backend == "tile_obj":
+        return None, norm_target, resolved_backend, verbose
     if resolved_backend not in _dispatch_map:
         raise ValueError(f'Cannot find support for execution backend "{resolved_backend}"')
     return _dispatch_map[resolved_backend], norm_target, resolved_backend, verbose
@@ -70,7 +72,7 @@ def cached(
     *args,
     target: TargetLike | None = None,
     target_host: TargetLike | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "tile_obj"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
@@ -79,6 +81,21 @@ def cached(
     Caches and reuses compiled kernels (using KernelCache class).
     """
     cache, norm_target, execution_backend, verbose = _resolve_cache_dispatch(target, execution_backend, verbose)
+    if cache is None:
+        if args:
+            raise TypeError("Tile uncached construction accepts keyword options only")
+        if verbose:
+            logging.getLogger(__name__).info("Tile disk cache is not implemented; building the device object")
+        return JITKernel(
+            func,
+            out_idx=out_idx,
+            target=norm_target,
+            target_host=target_host,
+            execution_backend=execution_backend,
+            verbose=verbose,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+        )
     return cache.cached(
         func,
         out_idx,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
+import json
 from typing import Any
 
 from tvm import IRModule, tirx
@@ -43,6 +44,7 @@ class TileLangIRTranslator(PyStmtExprVisitor):
         self._execution_scope_modes: list[str] = []
 
     def translate(self, source_module: IRModule) -> str:
+        self._jit_functions = []
         # 1. Check that the input is a tvm.IRModule
         if not isinstance(source_module, IRModule):
             raise TypeError(
@@ -84,7 +86,11 @@ class TileLangIRTranslator(PyStmtExprVisitor):
                                 )
                             self._emit_prim_func(global_var.name_hint, base_func)
                     module.operation.verify()
-                    source = str(module)
+                    # A Python-side handoff only. OpenTileAS sees an ordinary
+                    # comment and does not need to preserve custom attributes.
+                    source = "// tilelang.launch.v1 " + json.dumps(
+                        {"functions": self._jit_functions}, separators=(",", ":")
+                    ) + "\n" + str(module)
             finally:
                 self.value_map.clear()
                 self._arith = None
@@ -102,6 +108,14 @@ class TileLangIRTranslator(PyStmtExprVisitor):
 
         self.value_map.clear()
         block_idx_bindings = self._collect_block_idx_bindings(prim_func.body)
+        self._jit_functions.append({
+            "name": name,
+            "kinds": ["handle" if param in prim_func.buffer_map else
+                      ("int32" if str(param.dtype) == "bool" else str(param.dtype))
+                      for param in prim_func.params],
+            "axes": [{"tag": tag, "extent": self._static_int(extent, tag + " extent")}
+                     for _var, extent, tag in block_idx_bindings],
+        })
 
         # 1. Parse the function parameters and create the MLIR function
         input_types = [self._parameter_type(param, prim_func) for param in prim_func.params]

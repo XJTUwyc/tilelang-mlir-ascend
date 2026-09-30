@@ -36,7 +36,7 @@ class BaseKernelAdapter(ABC):
         if result_idx is None:
             result_idx = []
         elif isinstance(result_idx, int):
-            if result_idx > len(params) or result_idx < -len(params):
+            if result_idx >= len(params) or result_idx < -len(params):
                 raise ValueError(f"result_idx should be an integer between {-len(params) - 1} and {len(params) - 1}")
             if result_idx < 0:
                 result_idx = len(params) + result_idx

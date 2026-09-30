@@ -1,23 +1,24 @@
 /*!
  * \file tile_obj_launcher.cc
- * \brief Lightweight load + launch for Tile backend objects (.o / aibin bytes).
+ * \brief Bind and launch compiler-owned Tile backend object bytes.
  *
- * Device compilation happens outside the repository (manual bisheng/ccec
- * artifacts).  This file only implements the runtime half:
+ * Device compilation is owned by the Tile JIT. This file implements the
+ * runtime half:
  *
  *   1. Lazily dlopen("libascendcl.so") and dlsym the ACL entry points,
  *      so TileLang keeps no CANN build-time dependency.
- *   2. Lazily load the object bytes via aclrtBinaryLoadFromData and resolve
- *      the kernel symbol via aclrtBinaryGetFunction (cached per device).
+ *   2. Bind object bytes and their ABI once, then lazily load and resolve the
+ *      kernel function per device.
  *   3. Pack arguments (int64-encoded on the Python side) into a contiguous
  *      aligned buffer.  The pack layout is computed once per kernel and
  *      cached; small kernels use a stack-backed buffer so steady-state
  *      launches do not allocate.
- *   4. Submit with aclrtLaunchKernelWithHostArgs.  The grid (logical core
- *      count) and dynamic UBUF size are computed by the Python side.
+ *   4. Submit with aclrtLaunchKernelWithHostArgs. The block count and dynamic
+ *      UBUF size are supplied by the compiler-produced launch specification.
  *
  * Python-side entry points:
- *   - tl.tile.LaunchKernel(..., args) uses ACL's automatic binary kind.
+ *   - tl.tile.BindKernel(object_bytes, name, arg_types) returns a token.
+ *   - tl.tile.LaunchKernel(token, ..., args) submits a bound kernel.
  *
  *   - arg_types[i] is one of:
  *       "handle", "int8", "int16", "int32", "int64",
@@ -41,6 +42,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -177,8 +179,8 @@ struct AclArgPackPlan {
   size_t buffer_size{0};
 };
 
-// Computed once per (function, arg_types) and cached; each launch only fills
-// the buffer.  Mirrors MakeAclArgPackPlan in tilelang-ascend-cce's
+// Computed once when object bytes are bound; each launch only fills the buffer.
+// Mirrors MakeAclArgPackPlan in tilelang-ascend-cce's
 // ascend_module.cc.
 AclArgPackPlan MakeAclArgPackPlan(const ffi::Array<ffi::String> &arg_types) {
   AclArgPackPlan plan;
@@ -230,10 +232,7 @@ void PackArg(AclArgKind kind, int64_t value, uint8_t *dst) {
 // case (<= 16 words, i.e. <= 128 bytes of arguments) never allocates.
 template <size_t kNumWords> class AclArgBuffer {
 public:
-  explicit AclArgBuffer(size_t num_words) {
-    TVM_FFI_ICHECK_LE(num_words, kNumWords)
-        << "AclArgBuffer capacity exceeded";
-  }
+  explicit AclArgBuffer(size_t) {}
 
   uint8_t *data() { return reinterpret_cast<uint8_t *>(storage_.data()); }
 
@@ -276,28 +275,10 @@ struct AclLaunchKernelCfg {
   size_t num_attrs;
 };
 
-// Local mirrors of the public ACL binary-load option ABI.  Keeping these
-// declarations here preservers the runtime's no-CANN-header build contract.
-union AclBinaryLoadOptionValue {
-  uint32_t is_lazy_load;
-  int32_t cpu_kernel_mode;
-  uint32_t reserved[4];
-};
-
-struct AclBinaryLoadOption {
-  int32_t type;
-  AclBinaryLoadOptionValue value;
-};
-
-struct AclBinaryLoadOptions {
-  AclBinaryLoadOption *options;
-  size_t num_options;
-};
-
-class TileDriver {
+class AclDriver {
 public:
-  static TileDriver *Global() {
-    static auto *driver = new TileDriver();
+  static AclDriver *Global() {
+    static auto *driver = new AclDriver();
     return driver;
   }
 
@@ -339,7 +320,7 @@ private:
                                                   size_t, void *, size_t);
   using GetRecentErrorMessageFn = const char *(*)();
 
-  TileDriver() {
+  AclDriver() {
     library_ = dlopen("libascendcl.so", RTLD_LAZY | RTLD_LOCAL);
     TVM_FFI_CHECK(library_ != nullptr, RuntimeError)
         << "Tile runtime could not load libascendcl.so: " << dlerror();
@@ -375,107 +356,83 @@ private:
 
 void CheckAcl(AclError result, const char *operation) {
   if (result == kAclSuccess) return;
-  const char *message = TileDriver::Global()->GetRecentErrorMessage();
+  const char *message = AclDriver::Global()->GetRecentErrorMessage();
   TVM_FFI_THROW(RuntimeError)
       << operation << " failed with ACL error " << result
       << (message == nullptr ? "" : std::string(": ") + message);
 }
 
 // ---------------------------------------------------------------------------
-// Binary / function handle cache (lazy load, process-lifetime)
+// Bound kernel registry (process lifetime)
 // ---------------------------------------------------------------------------
 
-class BinaryRegistry {
+using BoundKernelToken = int64_t;
+
+struct BoundKernel {
+  std::string object_bytes;
+  std::string kernel_name;
+  AclArgPackPlan pack_plan;
+  std::unordered_map<int32_t, AclBinHandle> binaries;
+  std::unordered_map<int32_t, AclFuncHandle> functions;
+};
+
+struct BoundLaunch {
+  const std::string *kernel_name;
+  const AclArgPackPlan *pack_plan;
+  AclFuncHandle function;
+};
+
+class AclKernelRegistry {
 public:
-  static BinaryRegistry *Global() {
-    static auto *registry = new BinaryRegistry();
+  static AclKernelRegistry *Global() {
+    static auto *registry = new AclKernelRegistry();
     return registry;
   }
 
-  // Loads the object bytes on first use (per device) and resolves the kernel
-  // symbol.  Handles are cached for the process lifetime; the OS reclaims
-  // them at exit (matches the Ascend backend's driver handles).
-  AclFuncHandle GetFunction(const std::string &obj_bytes,
-                            const std::string &kernel_name, int32_t device_id) {
+  BoundKernelToken Bind(ffi::Bytes object_bytes, ffi::String kernel_name,
+                        const ffi::Array<ffi::String> &arg_types) {
+    std::string symbol = kernel_name.operator std::string();
+
+    auto kernel = std::make_unique<BoundKernel>();
+    kernel->object_bytes.assign(object_bytes.data(), object_bytes.size());
+    kernel->kernel_name = std::move(symbol);
+    kernel->pack_plan = MakeAclArgPackPlan(arg_types);
+
     std::lock_guard<std::mutex> lock(mutex_);
-    TileDriver *driver = TileDriver::Global();
-    // Keep the full object contents in the in-process cache key.
-    // BinaryKeyHash is used only for unordered_map bucket selection;
-    // BinaryKey::operator== still compares the complete object bytes,
-    // device id, so hash collisions cannot alias handles.
-    // A future persistent or cross-language cache must define a separate,
-    // versioned and stable digest/key schema.
-    BinaryKey key{obj_bytes, device_id};
-    AclBinHandle &binary = binaries_[key];
-    if (binary == nullptr) {
-      CheckAcl(driver->BinaryLoadFromData(obj_bytes.data(), obj_bytes.size(), &binary),
-               "aclrtBinaryLoadFromData");
-    }
-    FuncKey fkey{binary, kernel_name};
-    AclFuncHandle &function = functions_[fkey];
-    if (function == nullptr) {
-      CheckAcl(driver->BinaryGetFunction(binary, kernel_name.c_str(), &function),
-               "aclrtBinaryGetFunction");
-    }
-    return function;
+    TVM_FFI_ICHECK_LT(next_token_, std::numeric_limits<BoundKernelToken>::max())
+        << "Tile bound-kernel token space exhausted";
+    BoundKernelToken token = next_token_++;
+    kernels_.emplace(token, std::move(kernel));
+    return token;
   }
 
-  // Returns the cached argument-pack layout for (function, arg_types), or
-  // builds and caches it on first use.  The returned pointer stays valid for
-  // the registry lifetime: unordered_map nodes keep their address across
-  // rehashes.
-  const AclArgPackPlan *GetPlan(AclFuncHandle function,
-                                const std::string &plan_key,
-                                const ffi::Array<ffi::String> &arg_types) {
+  BoundLaunch GetLaunch(BoundKernelToken token, int32_t device_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PlanKey key{function, plan_key};
-    auto found = plans_.find(key);
-    if (found != plans_.end()) {
-      return &found->second;
+    auto found = kernels_.find(token);
+    TVM_FFI_ICHECK(found != kernels_.end())
+        << "Unknown Tile bound-kernel token " << token;
+
+    BoundKernel *kernel = found->second.get();
+    AclDriver *driver = AclDriver::Global();
+    AclBinHandle &binary = kernel->binaries[device_id];
+    if (binary == nullptr) {
+      CheckAcl(driver->BinaryLoadFromData(kernel->object_bytes.data(),
+                                          kernel->object_bytes.size(), &binary),
+               "aclrtBinaryLoadFromData");
     }
-    auto inserted = plans_.emplace(std::move(key), MakeAclArgPackPlan(arg_types));
-    return &inserted.first->second;
+    AclFuncHandle &function = kernel->functions[device_id];
+    if (function == nullptr) {
+      CheckAcl(driver->BinaryGetFunction(binary, kernel->kernel_name.c_str(),
+                                          &function),
+               "aclrtBinaryGetFunction");
+    }
+    return {&kernel->kernel_name, &kernel->pack_plan, function};
   }
 
 private:
-  struct BinaryKey {
-    std::string obj_bytes;
-    int32_t device_id;
-
-    bool operator==(const BinaryKey &other) const {
-      return obj_bytes == other.obj_bytes &&device_id == other.device_id;
-    }
-  };
-
-  using FuncKey = std::pair<AclBinHandle, std::string>;
-  using PlanKey = std::pair<AclFuncHandle, std::string>;
-
-  struct BinaryKeyHash {
-    size_t operator()(const BinaryKey &key) const {
-      size_t hash = std::hash<std::string>{}(key.obj_bytes);
-      hash ^= std::hash<int32_t>{}(key.device_id) << 1;
-      return hash;
-    }
-  };
-
-  struct FuncKeyHash {
-    size_t operator()(const FuncKey &key) const {
-      return std::hash<const void *>{}(key.first) ^
-             (std::hash<std::string>{}(key.second) << 1);
-    }
-  };
-
-  struct PlanKeyHash {
-    size_t operator()(const PlanKey &key) const {
-      return std::hash<const void *>{}(key.first) ^
-             (std::hash<std::string>{}(key.second) << 1);
-    }
-  };
-
   std::mutex mutex_;
-  std::unordered_map<BinaryKey, AclBinHandle, BinaryKeyHash> binaries_;
-  std::unordered_map<FuncKey, AclFuncHandle, FuncKeyHash> functions_;
-  std::unordered_map<PlanKey, AclArgPackPlan, PlanKeyHash> plans_;
+  BoundKernelToken next_token_{1};
+  std::unordered_map<BoundKernelToken, std::unique_ptr<BoundKernel>> kernels_;
 };
 
 // ---------------------------------------------------------------------------
@@ -483,14 +440,14 @@ private:
 // ---------------------------------------------------------------------------
 
 // Fills a stack- or heap-backed argument buffer and submits the kernel.
-// Returns the raw ACL error code; error reporting stays in LaunchKernelImpl
-// so the grid/ubuf context is attached in exactly one place.
+// Returns the raw ACL error code; error reporting stays in the launch entry
+// point so block-count and dynamic-UBUF context are attached in one place.
 template <size_t kNumWords>
-AclError LaunchPacked(TileDriver *driver, AclFuncHandle function,
-                      uint32_t num_blocks, AclStream stream,
-                      AclLaunchKernelCfg *config,
-                      const AclArgPackPlan &plan,
-                      const ffi::Array<int64_t> &args) {
+AclError PackAndLaunch(AclDriver *driver, AclFuncHandle function,
+                       uint32_t num_blocks, AclStream stream,
+                       AclLaunchKernelCfg *config,
+                       const AclArgPackPlan &plan,
+                       const ffi::Array<int64_t> &args) {
   AclArgBuffer<kNumWords> buffer(plan.buffer_size / sizeof(uint64_t));
   uint8_t *base = buffer.data();
   for (size_t i = 0; i < plan.args.size(); ++i) {
@@ -500,77 +457,68 @@ AclError LaunchPacked(TileDriver *driver, AclFuncHandle function,
                                           config, base, plan.buffer_size);
 }
 
-void LaunchKernelImpl(ffi::Bytes o_bytes, ffi::String kernel_name, int64_t grid,
-                      int64_t ubuf_size, uint64_t stream,
-                      ffi::Array<ffi::String> arg_types,
-                      ffi::Array<int64_t> args) {
-  TVM_FFI_ICHECK(grid > 0)
-      << "Tile launch grid must be positive, got " << grid;
-  TVM_FFI_ICHECK(grid <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-      << "Tile launch grid exceeds uint32 range: " << grid;
-  TVM_FFI_ICHECK(ubuf_size >= 0)
-      << "Tile dynamic UBUF size must be non-negative, got " << ubuf_size;
-  TVM_FFI_ICHECK(ubuf_size <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-      << "Tile dynamic UBUF size exceeds uint32 range: " << ubuf_size;
-  TVM_FFI_ICHECK_EQ(args.size(), arg_types.size())
-      << "Tile kernel `" << kernel_name.operator std::string() << "` expects "
-      << arg_types.size() << " arguments but got " << args.size();
+BoundKernelToken BindTileObjectKernel(
+    ffi::Bytes object_bytes, ffi::String kernel_name,
+    ffi::Array<ffi::String> arg_types) {
+  return AclKernelRegistry::Global()->Bind(object_bytes, kernel_name, arg_types);
+}
 
-  TileDriver *driver = TileDriver::Global();
+void LaunchTileObjectKernel(BoundKernelToken kernel_token, int64_t block_count,
+                            int64_t dynamic_ubuf_bytes, uint64_t stream,
+                            ffi::Array<int64_t> args) {
+  // Static launch values were validated when TileLaunchSpec was built. Keep
+  // only the structural checks needed to pack this FFI call safely.
+  AclDriver *driver = AclDriver::Global();
   int32_t device_id = 0;
   CheckAcl(driver->GetDevice(&device_id), "aclrtGetDevice");
-  std::string symbol = kernel_name.operator std::string();
-  AclFuncHandle function = BinaryRegistry::Global()->GetFunction(
-      std::string(o_bytes.data(), o_bytes.size()), symbol, device_id);
-
-  // The pack layout depends only on arg_types: cache it per function so
-  // repeated launches neither re-parse nor re-allocate.
-  std::string plan_key;
-  for (size_t i = 0; i < arg_types.size(); ++i) {
-    if (i != 0) {
-      plan_key.push_back(',');
-    }
-    plan_key += arg_types[i].operator std::string();
-  }
-  const AclArgPackPlan *plan = BinaryRegistry::Global()->GetPlan(
-      function, plan_key, arg_types);
+  BoundLaunch bound =
+      AclKernelRegistry::Global()->GetLaunch(kernel_token, device_id);
+  TVM_FFI_ICHECK_EQ(args.size(), bound.pack_plan->args.size())
+      << "Tile kernel `" << *bound.kernel_name << "` expects "
+      << bound.pack_plan->args.size() << " arguments but got " << args.size();
 
   AclLaunchKernelAttr attribute{};
   AclLaunchKernelCfg config{};
   AclLaunchKernelCfg *config_ptr = nullptr;
-  if (ubuf_size > 0) {
+  if (dynamic_ubuf_bytes > 0) {
     attribute.id = kAclLaunchKernelAttrDynUbufSize;
-    attribute.value.dyn_ubuf_size = static_cast<uint32_t>(ubuf_size);
+    attribute.value.dyn_ubuf_size =
+        static_cast<uint32_t>(dynamic_ubuf_bytes);
     config.attrs = &attribute;
     config.num_attrs = 1;
     config_ptr = &config;
   }
 
   AclError result;
-  size_t num_words = plan->buffer_size / sizeof(uint64_t);
+  size_t num_words = bound.pack_plan->buffer_size / sizeof(uint64_t);
   if (num_words <= 4) {
-    result = LaunchPacked<4>(driver, function, static_cast<uint32_t>(grid),
-                             reinterpret_cast<AclStream>(stream), config_ptr,
-                             *plan, args);
-  } else if (num_words <= 8) {
-    result = LaunchPacked<8>(driver, function, static_cast<uint32_t>(grid),
-                             reinterpret_cast<AclStream>(stream), config_ptr,
-                             *plan, args);
-  } else if (num_words <= 16) {
-    result = LaunchPacked<16>(driver, function, static_cast<uint32_t>(grid),
+    result = PackAndLaunch<4>(driver, bound.function,
+                              static_cast<uint32_t>(block_count),
                               reinterpret_cast<AclStream>(stream), config_ptr,
-                              *plan, args);
+                              *bound.pack_plan, args);
+  } else if (num_words <= 8) {
+    result = PackAndLaunch<8>(driver, bound.function,
+                              static_cast<uint32_t>(block_count),
+                              reinterpret_cast<AclStream>(stream), config_ptr,
+                              *bound.pack_plan, args);
+  } else if (num_words <= 16) {
+    result = PackAndLaunch<16>(driver, bound.function,
+                               static_cast<uint32_t>(block_count),
+                               reinterpret_cast<AclStream>(stream), config_ptr,
+                               *bound.pack_plan, args);
   } else {
-    result = LaunchPacked<0>(driver, function, static_cast<uint32_t>(grid),
-                             reinterpret_cast<AclStream>(stream), config_ptr,
-                             *plan, args);
+    result = PackAndLaunch<0>(driver, bound.function,
+                              static_cast<uint32_t>(block_count),
+                              reinterpret_cast<AclStream>(stream), config_ptr,
+                              *bound.pack_plan, args);
   }
   if (result != kAclSuccess) {
     const char *message = driver->GetRecentErrorMessage();
     std::ostringstream error;
-    error << "aclrtLaunchKernelWithHostArgs failed for " << symbol
-          << " with ACL error " << result << ", grid=" << grid
-          << ", dyn_ubuf_bytes=" << ubuf_size;
+    error << "aclrtLaunchKernelWithHostArgs failed for " << *bound.kernel_name
+          << " with ACL error " << result
+          << ", block_count=" << block_count
+          << ", dynamic_ubuf_bytes=" << dynamic_ubuf_bytes;
     if (message != nullptr) {
       error << ": " << message;
     }
@@ -581,7 +529,8 @@ void LaunchKernelImpl(ffi::Bytes o_bytes, ffi::String kernel_name, int64_t grid,
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
-      .def("tl.tile.LaunchKernel", &LaunchKernelImpl);
+      .def("tl.tile.BindKernel", &BindTileObjectKernel)
+      .def("tl.tile.LaunchKernel", &LaunchTileObjectKernel);
 }
 
 } // namespace

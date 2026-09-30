@@ -2,5 +2,6 @@ from . import target  # noqa: F401
 from . import pipeline  # noqa: F401
 from . import codegen  # noqa: F401
 
-# Stage-1 lightweight .o load/launch (device compiled outside the repo).
-from .tile_obj import load_tile_obj, compile_tile_obj, extract_launch_info, LaunchInfo, TileObjKernel  # noqa: F401
+from . import execution_backend  # noqa: F401
+from .manifest import ParameterBinding, ConstantBinding, DeviceArgument, TileLaunchSpec  # noqa: F401
+from .compiler import TileCompilationResult, compile_tile_obj  # noqa: F401

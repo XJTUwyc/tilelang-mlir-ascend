@@ -65,7 +65,7 @@ class JITKernel(Generic[_P, _T]):
         self,
         func: PrimFunc = None,
         out_idx: list[int] | int = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "tile_obj"] = "tvm_ffi",
         target: TargetLike = "auto",
         target_host: TargetLike | None = None,
         verbose: bool = False,
@@ -82,7 +82,7 @@ class JITKernel(Generic[_P, _T]):
             The TileLang TIR function to compile and wrap.
         out_idx : Union[List[int], int], optional
             Index(es) of the output tensors to return (default: None).
-        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "tile_obj"], optional
             Execution backend to use for kernel execution.
         target : str, dict, or tvm.target.Target, optional
             Compilation target (default: "auto"). Use a dict for target attributes,
@@ -97,19 +97,11 @@ class JITKernel(Generic[_P, _T]):
         from_database : bool, optional
             Whether to create a TorchFunction from a database.
         """
-        self.prim_func = func
-        self.target_host = target_host
-        self.verbose = verbose
-
-        self.pass_configs = normalize_pass_configs(pass_configs)
-
-        self.compile_flags = [compile_flags] if isinstance(compile_flags, str) else compile_flags
-
-        # The wrapper is normalized here because lower/codegen still consume TVM Target.
-        self.target = determine_target(target, return_object=True)
-
-        self.execution_backend_spec = resolve_execution_backend_spec(execution_backend, self.target)
-        self.execution_backend = self.execution_backend_spec.name
+        self._initialize_state(
+            func=func, target=target, target_host=target_host,
+            execution_backend=execution_backend, verbose=verbose,
+            pass_configs=pass_configs, compile_flags=compile_flags,
+        )
 
         if self.execution_backend == "cython":
             from tilelang.contrib.cc import get_cplus_compiler
@@ -139,6 +131,29 @@ class JITKernel(Generic[_P, _T]):
         # The adapter's function is assigned as the callable function for this instance.
         self.adapter = adapter
         self.torch_function = adapter.func
+
+    def _initialize_state(
+            self, *, func, target, target_host, execution_backend,
+            verbose=False, pass_configs=None, compile_flags=None,
+    ):
+        """Common state for compilation and cache restoration."""
+        self.prim_func = func
+        self.target_host = target_host
+        self.verbose = verbose
+
+        self.pass_configs = normalize_pass_configs(pass_configs)
+
+        self.compile_flags = [compile_flags] if isinstance(compile_flags, str) else compile_flags
+
+        # The wrapper is normalized here because lower/codegen still consume TVM Target.
+        self.target = determine_target(target, return_object=True)
+
+        self.execution_backend_spec = resolve_execution_backend_spec(execution_backend, self.target)
+        self.execution_backend = self.execution_backend_spec.name
+
+        self.artifact = None
+        self.adapter = None
+        self.torch_function = None
 
     @classmethod
     def from_database(
@@ -270,7 +285,21 @@ class JITKernel(Generic[_P, _T]):
                 return adapter_cls(**kwargs)
 
         # Create an adapter based on the specified execution backend.
-        if execution_backend == "tvm_ffi":
+        if execution_backend == "tile_obj":
+            from tilelang.opentile.compiler import compile_tile_obj
+            from tilelang.jit.adapter.tile import TileKernelAdapter
+
+            with jit_phase("device_compile", verbose=verbose, **phase_context):
+                result = compile_tile_obj(
+                    artifact, pass_configs=pass_configs, verbose=verbose,
+                )
+            adapter = create_adapter(
+                TileKernelAdapter,
+                artifact=artifact,
+                compilation_result=result,
+                result_idx=out_idx,
+            )
+        elif execution_backend == "tvm_ffi":
             # Use TVMFFIKernelAdapter for interoperability with PyTorch via DLPack.
             # But we need to ensure that the runtime is enabled and the runtime module is not None.
             assert artifact.rt_mod is not None, "tvm_ffi backend requires a runtime module."
@@ -472,7 +501,7 @@ class JITKernel(Generic[_P, _T]):
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "tile_obj"}:
             return self.adapter.get_kernel_source(kernel_only=kernel_only)
         return self.artifact.kernel_source
 
@@ -480,7 +509,7 @@ class JITKernel(Generic[_P, _T]):
         """
         Returns the source code of the host function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "tile_obj"}:
             return self.adapter.get_host_source()
         assert self.artifact.host_mod is not None, "host_mod is not available"
         return str(self.artifact.host_mod)
@@ -652,7 +681,7 @@ class JITKernel(Generic[_P, _T]):
 
     @property
     def host_source(self) -> str:
-        if self.artifact:
+        if self.artifact and self.artifact.host_mod is not None:
             return str(self.artifact.host_mod)
         get_host_source = getattr(self.adapter, "get_host_source", None)
         if get_host_source is None:

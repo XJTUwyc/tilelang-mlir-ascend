@@ -101,7 +101,10 @@ def resolve_execution_backend_spec(requested: str | None, target: Target) -> Exe
     if requested_name in (None, "auto"):
         if not allowed_available_specs:
             raise ValueError(f"No available execution backend for target '{target.kind.name}'. Allowed: {_format_options(allowed_all)}.")
-        return allowed_available_specs[0]
+        # Like device-codegen selection, prefer a target-specific backend
+        # over generic registrations for the same TVM target kind.
+        specific = [spec for spec in allowed_available_specs if spec.supports_target is not None]
+        return (specific or allowed_available_specs)[0]
 
     if requested_name not in allowed_all:
         raise ValueError(
