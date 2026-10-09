@@ -17,6 +17,7 @@ from tileops.manifest import load_manifest
 from tileops.reporting.analyzer import analyze_run
 from tileops.reporting.collector import load_benchmark_report, parse_junit_report
 from tileops.reporting.report import write_reports
+from tileops.reporting.session_timing import attach_session_timing
 from tileops.reporting.setup_info import collect_setup_info
 
 
@@ -37,6 +38,7 @@ def list_operators() -> list[dict[str, Any]]:
                 "status": entry.get("status"),
                 "test": source.get("test"),
                 "benchmark": source.get("bench"),
+                "kernel": source.get("kernel"),
             }
         )
     return operators
@@ -93,6 +95,31 @@ def _reject_xdist(pytest_args: list[str], pytest_addopts: str | None) -> None:
                 "pytest-xdist is not supported by tileops-report: benchmark workers "
                 "would overwrite benchmark.json. Run the report serially."
             )
+
+
+def _exclude_smoke(pytest_args: list[str]) -> list[str]:
+    """Return benchmark-only pytest args with smoke cases excluded."""
+    remaining: list[str] = []
+    expressions: list[str] = []
+    index = 0
+    while index < len(pytest_args):
+        arg = pytest_args[index]
+        if arg in {"-m", "--markexpr"}:
+            if index + 1 >= len(pytest_args):
+                raise ValueError(f"{arg} requires a marker expression")
+            expressions.append(pytest_args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--markexpr=") or arg.startswith("-m="):
+            expressions.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+
+    expression = " and ".join(f"({item})" for item in expressions if item.strip())
+    expression = f"{expression} and not smoke" if expression else "not smoke"
+    return [*remaining, "-m", expression]
 
 
 def _git_commit(root: Path) -> str | None:
@@ -159,6 +186,7 @@ def run_operator(
     pytest_args: list[str] | None = None,
     timeout: int | None = None,
     root: str | Path | None = None,
+    with_session_timing: bool = False,
 ) -> tuple[dict[str, Any], Path, int]:
     """Run correctness then benchmark, and emit one self-contained report directory."""
     repo_root = Path(root).resolve() if root else project_root()
@@ -231,7 +259,7 @@ def run_operator(
             junit_path=benchmark_xml,
             log_path=pytest_dir / "benchmark.log",
             env=benchmark_env,
-            pytest_args=args,
+            pytest_args=_exclude_smoke(args),
             timeout=timeout,
         )
         benchmark_tests = parse_junit_report(benchmark_xml)
@@ -281,6 +309,12 @@ def run_operator(
         metadata=metadata,
         setup=setup,
         operator_catalog=operator_catalog,
+    )
+    attach_session_timing(
+        run,
+        root=repo_root,
+        operator_catalog=operator_catalog,
+        enabled=with_session_timing,
     )
     write_reports(run, run_dir)
 

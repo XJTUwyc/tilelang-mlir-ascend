@@ -45,9 +45,26 @@ MIN_LINES = 20
 SENTINELS = {
     "new-op.md": ["编程模式偏好", "调优必要信息收集"],
     "migration.md": ["三问解读", "迁移前后保持不变", "无 Stage 0 / Stage 5"],
-    "harness.md": ["extracted_functions", "migration init --op-slug"],
+    "harness.md": [
+        "extracted_functions",
+        "migration init --op-slug",
+        "在这个 session 的执行过程中，基于 OpenCode 自己的日志分析",
+    ],
     "optimize.md": ["翻转切换块注释"],
 }
+
+
+def test_session_timing_prompt_precedes_distillation_contract():
+    main = MAIN.read_text(encoding="utf-8")
+    harness = (SCENARIO_DIR / "harness.md").read_text(encoding="utf-8")
+    prompt = "在这个 session 的执行过程中，基于 OpenCode 自己的日志分析"
+    artifact = "examples/{op_slug}/SESSION_TIMING_ANALYSIS.md"
+    distill = "调度 `@tilelang-skill-evolver`（`mode=distill`）"
+
+    assert prompt in harness
+    assert artifact in harness
+    assert "SESSION_TIMING_ANALYSIS.md" in main
+    assert "Session 耗时分析和报告重渲染" in main[: main.index(distill)]
 
 
 def read(path: Path) -> str:

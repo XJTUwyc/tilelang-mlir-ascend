@@ -45,6 +45,8 @@
 | PL-1.6-copy-floor | copy-floor 标定法 + MTE2 带宽退化曲线 + 混合流量地板 + grid-stride 反直觉 + 标量削减判定式（数字见条目） | verified |
 | PL-1.10-loads-first-decoupling | 单 staging 复用链致 MTE2/VEC 零重叠 → per-input staging + 三输入前置装载（收益数字见条目） | verified |
 | PL-1.14-mte3-strided-ws | 跨引擎 ws 中继写侧必须块连续（band 化 MTE3 3× 回退；读侧逐块入 L1 band 列偏移区两全） | verified |
+| PL-1.19-scatter-col-write-amplification | (M,1) 列切片 UB→GM 写 42× 放大 → 扁平 chunk-major 连续写 | verified |
+| PL-1.20-nsplit-perrow-partial | C6 N-split per-row partial + transpose merge（小 M 大 N 2.2–2.6×；tn=最大单波 nchunk≤cores） | verified |
 
 ### attention.md — Expert persistent / attention 族
 
@@ -76,6 +78,9 @@
 | TRAP-UB-dynsubview-dominance | task 级 UB 行 + 嵌套循环动态偏移 subview → auto-multi-buffer 非支配 IR（Q≥128） | verified |
 | TRAP-expert-v-operands | Expert v 算子操作数规则（vcmp 拒绝 tir.Cast 等） | verified |
 | TRAP-transpose-epilogue-poison | 活跃源 transpose epilogue 毒化整 kernel（2.6x；绕法 = 增维视图） | verified |
+| TRAP-parallel2d-bm-ge2-scalarize | 2D T.Parallel(bm,N) 融合 ite 在 bm≥2 标量化（与操作数形态无关；链式/per-row 绕法） | verified |
+| TRAP-vbrc-same-shape-empty-broadcast | vbrc 同形 src/dst → 空广播维数组 MLIR verify fail | verified |
+| TRAP-vselect-inplace-carried-state | 原位 vselect(cond,A,B,B) 多迭代 T.serial 丢 loop-carried 状态（tile-0 局部值）；绕法 = noalias select + T.copy 回写 | verified |
 
 ### traps-runtime.md — 运行时/数值/语义陷阱
 
@@ -105,6 +110,9 @@
 | CONST-flag-id-budget | flag id 预算 ≤15/核（n-block 下标可贴限） | verified |
 | CONST-store-fixpipe-gm-only | store_fixpipe 仅 L0C→GM（跨引擎传输强制 GM 往返） | verified |
 | CONST-aicore-910B2C | 物理核数 24 AICore + persistent 任务平衡公式 | verified |
+| CONST-arange-scalar-materialize | T.arange (M,W) 物化标量 ~1ns/elem；(1,N)+首轴 vbrc 绕法（-18.2%） | verified |
+| CONST-gm-to-ub-bw-dilution | gm_to_ub_bw 是总时长稀释口径（用 mte2_ratio×aiv_time 判搬运）；跨步列块 2D 读不慢（0.98× 对照 + 误读更正） | verified |
+| CONST-reduce-dims0-skinny | dims=0 长条形 (K,4) 逐列串行（(400,4)=33µs）；transpose+dims=1 绕法 | verified |
 
 ### cases.md — 案例索引与参考实现集
 
@@ -118,6 +126,8 @@
 | CASE-pool-maxpool3d-standalone | standalone 池化算子目录 | verified |
 | CASE-attention-gqa-expert-full | Expert attention 迁移完整档案（设计修订链 + debug_log D1–D6） | verified |
 | CASE-attention-expert-stage4 | attention expert Stage 4 三轮调优档案（含 [DESIGN_LIMIT] 修正闭环） | verified |
+| CASE-argmax-argreduce-stage4 | argmax Stage 4 档案（C6 预注册裁决翻转 2.2×/2.6× + 标量化归因证伪更正；几何 11.5×） | verified |
+| CASE-argmax-argreduce-integration | TileOPs reduce 族集成契约参考（N_padded 声明宽度 / wrapper config 转调 _select_config / argmin +inf pad） | verified |
 | CASE-attention-developer-stage4 | developer 谱系同门对照档案 | verified |
 | CASE-deepseek-v4-highperf | Expert 跨引擎结构先例（vcmp/flag 协议） | verified |
 | CASE-ref-flash-attn-npuir | **参考实现集首条**：两相位结构参照锚点（[DESIGN_LIMIT] 强制对照） | verified |

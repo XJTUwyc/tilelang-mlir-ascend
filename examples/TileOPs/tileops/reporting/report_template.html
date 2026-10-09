@@ -208,6 +208,7 @@
     .case-detail summary strong { color: var(--ink); text-align: right; }
     .case-detail summary::after { content: "展开"; color: var(--accent); font-size: .625rem; }
     .case-detail[open] summary::after { content: "收起"; }
+    .timing-detail summary { grid-template-columns: minmax(180px, 1fr) 110px 100px 36px; }
     .case-index { color: var(--accent); font-weight: 700; }
     .detail-grid { padding: 0 14px 14px; }
     .detail-grid table { width: 100%; border-collapse: collapse; font-size: .6875rem; }
@@ -317,7 +318,7 @@
     <div class="table-wrap">
       <table>
         <caption>Table 1. Results by operator</caption>
-        <thead><tr><th>#</th><th>Operator</th><th>Correctness</th><th>Avg Max Abs Error</th><th>Performance Shapes</th><th>Ratio Range</th></tr></thead>
+        <thead><tr><th>#</th><th>Operator</th>{{TIMING_ANALYSIS_HEADER}}<th>Correctness</th><th>Avg Max Abs Error</th><th>Performance Shapes</th><th>Ratio Range</th></tr></thead>
         <tbody>{{OPERATOR_ANALYSIS_ROWS}}</tbody>
       </table>
     </div>

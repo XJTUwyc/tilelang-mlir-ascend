@@ -171,3 +171,54 @@ repro: none
 ### 物理核数 = 24 AI Core（Ascend910B2C）
 
 persistent 结构按 24 核设计（logical tasks = ceildiv(S,bm)·H·B；wall-rows = ceil(ceildiv(S,bm)/24)·bm——bm=44 使 S=1024/2048/4096 得 44/88/176 行）。实查命令：`NPUUtils.get().get_aicore_num()`（设计期分核三要素之一，禁止假设值）。
+
+---
+id: CONST-arange-scalar-materialize
+kind: constant
+family: [reduction, elementwise]
+apis: [T.arange, T.vbrc]
+dtype: [fp16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_arange_scalar.py
+---
+
+### T.arange (M,W) 物化按标量执行 ~1ns/elem；(1,N)+首轴 vbrc 绕法
+
+`T.arange(idx_j, [0,1], 0)` 把 (M,W) 索引缓冲逐元素标量写入（(2,4096) 实测 8.56µs ≈ 1.05ns/elem，占 hidden-state 链式 47µs 的 18%）。绕法：`T.arange(idx_row, [0,1],0)` 于 (1,N) + `T.vbrc(idx_row, idx_j)` 首轴广播 (1,N)→(M,N)（文档合法 src (1,N,K)→(M,N,K)），实测 46.97→38.41µs（-18.2%）。bm=1 时两形相同——同形 vbrc 触发空广播维 verify fail（见 TRAP-vbrc-same-shape-empty-broadcast）。判据：链式 kernel 的固定开销 ∝ 首个 (M,W) 缓冲元素数且 scalar 占比高。
+
+---
+id: CONST-gm-to-ub-bw-dilution
+kind: constant
+family: [reduction, elementwise, general]
+apis: [T.copy]
+dtype: [fp16, bf16]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_strided_colblock_read.py
+---
+
+### gm_to_ub_bw 是总时长稀释口径；跨步列块 2D 读本身不慢（误读更正记录）
+
+**误判更正**：曾把 partial 的 gm_to_ub_bw 0.80–1.11 GB/s/core 读成「(M,tn) 跨步列块读慢」——实为**标量化计算拉长总时长、带宽被稀释**（同 profile 的 mte2_active_bw 一直有 24.9GB/s；mte2_ratio 仅 0.05–0.15）。copy-only A/B（(M,tn) 2D 列块读 vs per-row (1,tn) 读，同写出量）：墙钟比 0.98×——**读形态无差异**。方法论：判断搬运瓶颈用 `mte2_ratio × aiv_time`（活跃时长）与 `*_active_bw`，勿用总量/总时长口径；(M,tn) 2D 跨步列块 copy 在段宽 ≥ 数百字节时性能正常（对照：窄「行」(bm,4) 的 16× 是**流量**膨胀〔GM_to_UB_datas 超采〕，非带宽下降——两类现象勿混）。
+
+---
+id: CONST-reduce-dims0-skinny
+kind: constant
+family: [reduction]
+apis: [T.reduce_max, T.reduce_min]
+dtype: [fp16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_dims0_skinny.py
+---
+
+### dims=0 归约在长条形 (K,4) 上逐列串行（文档合法但灾难性慢）
+
+`T.reduce_max(val_f (nchunk,M), g, dim=0)` 在长第一轴窄第二轴（(400,4)/(80,4)）实测 33.4/8.8µs——逐列串行 walk（~21ns/elem）。绕法：shared staging + `T.transpose((K,M)→(M,K), permutation=[1,0])` + dims=1 链（PL-1.1 家族），同数据 3.3µs。dims=1（行向归约）为快路径；dims=0 仅在第二轴足够宽时可用。

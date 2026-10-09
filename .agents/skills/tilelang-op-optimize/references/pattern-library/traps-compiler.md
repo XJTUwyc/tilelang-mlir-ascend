@@ -210,3 +210,54 @@ repro: repro/PL-1.13-aiv-dup-subid-split.py
 - **绕法**：①退回 per-block GM 直载（基线形态，多 ~12 次 tiny GM 读/任务）；②切片偏移静态化（trace 分派）；③尝试关 auto-multi-buffer（未在本任务验证——会全局改变 L1/UB 多缓冲行为，风险自担）。
 - 关联：PL-1.9-hardlimits「v-op codegen 拒绝多维 UB 切片操作数」——本条是 copy 路径 + multi-buffer pass 的同族表现。
 - 溯源：`examples/ssd_chunk_scan/_ssd_chunk_scan_fwd_kernel/perf_opt/logs/round1/v3_hoist_L0.log`（报错全文）；npuir 现场见 opt_log R1 v3 行分析。
+
+---
+id: TRAP-parallel2d-bm-ge2-scalarize
+kind: trap
+family: [reduction, elementwise]
+apis: [T.Parallel, T.if_then_else]
+dtype: [fp16, bf16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_parallel2d_bm2_scalarize.py
+---
+
+### 2D T.Parallel(bm,N) 融合 if_then_else 在 bm≥2 整体标量化（与操作数形态无关）
+
+`for i,j in T.Parallel(bm,N): cand[i,j]=T.if_then_else(x[i,j]==ext[i,j], T.cast(j,"float32"), BIG)` 在 bm≥2 时 scalar ratio 0.84–0.95（(2,4096) 222µs）；bm=1 同形态向量化正常（tiled (1,5120) 25.9µs）。**操作数变体对照证伪旧归因**：(bm,1) 直接索引 m[i,0]（0.95）、ext_brc 物化 + x_work staging（0.948）——两者同样标量化，触发器是循环形态本身。绕法：bm≥2 用显式向量 op 链（vbrc/vcmp/vselect，r1a 形态 47µs）或 per-row (1,W) 展开循环（PL-1.20）。证伪更正留痕：argmax opt_log Iteration 4（session-1 嫌疑 (a)/(b) 均否）。
+
+---
+id: TRAP-vbrc-same-shape-empty-broadcast
+kind: trap
+family: [general]
+apis: [T.vbrc]
+dtype: []
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_vbrc_same_shape.py
+---
+
+### vbrc 同形 src/dst → 空广播维数组 MLIR verify fail
+
+`T.vbrc(idx_row (1,N), idx_j (1,N))`（src 与 dst 完全同形，无尺寸差维）→ `'hivm.hir.vbrc' op have empty broadcast dims array` 编译期 verify 失败。绕法：同形场景直接用源缓冲（或 T.copy）；vbrc 仅在存在尺寸 1 的差维时使用。
+
+---
+id: TRAP-vselect-inplace-carried-state
+kind: trap
+family: [reduction, general]
+apis: [T.vselect, T.copy, T.serial]
+dtype: [fp16]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/TRAP-vselect-inplace-carried-state.py
+---
+
+### 原位 T.vselect(cond, A, B, B) 在多迭代 T.serial 循环丢失 loop-carried 状态
+
+在线递推（running (max, idx) 类）跨 tile 级联时，`T.vselect(cond, chunk, running, running)`（false 操作数同时是输出）在多迭代 `T.serial` 循环中静默丢失状态——最终输出停留在 tile-0 局部值。触发边界：单迭代（num_full==2）不受影响，num_full ≥ 3（≥2 次更新迭代）才暴露。实测（argmax (4,102400) tn=5120、num_full=20，fp16）：inplace 得 `[4779,3248,2345,1833]`（全为 tile-0 局部索引，真值 `[31919,3248,44964,44710]`）；同 kernel 无别名形态 bit-exact 与 torch.argmax 一致。绕法 = select 到独立 scratch + `T.copy` 回写（多一对 (bm,1) 微缓冲的可忽略代价）。诊断指纹：输出全落 tile-0 局部索引 ⟹ loop-carried 状态未携带。

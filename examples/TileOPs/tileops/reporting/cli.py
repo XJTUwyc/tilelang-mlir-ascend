@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 
 from tileops.reporting.report import write_reports
-from tileops.reporting.runner import list_operators, run_operator
+from tileops.reporting.runner import list_operators, project_root, run_operator
+from tileops.reporting.session_timing import attach_session_timing
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--prof-mode", choices=("msprof", "events"), default="msprof")
     run.add_argument("--kernel-name", help="explicit TILEOPS_MSPROF_KERNEL_NAME")
     run.add_argument("--reports-dir", default="reports/tileops")
+    run.add_argument(
+        "--with-session-timing",
+        action="store_true",
+        help="add per-operator timing from SESSION_TIMING_ANALYSIS.md",
+    )
     run.add_argument("--timeout", type=int, help="timeout in seconds for each pytest stage")
     run.add_argument(
         "--pytest-arg",
@@ -43,6 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render", help="regenerate Markdown/HTML from run.json")
     render.add_argument("run_json")
     render.add_argument("--output-dir")
+    render.add_argument(
+        "--with-session-timing",
+        action="store_true",
+        help="discover timing Markdown and add the optional timing view",
+    )
     return parser
 
 
@@ -59,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "render":
         source = Path(args.run_json).resolve()
         run = json.loads(source.read_text(encoding="utf-8"))
+        attach_session_timing(
+            run,
+            root=project_root(),
+            operator_catalog=list_operators(),
+            enabled=args.with_session_timing,
+        )
         output = Path(args.output_dir).resolve() if args.output_dir else source.parent
         paths = write_reports(run, output)
         print(f"Reports written to {paths['markdown']} and {paths['html']}")
@@ -74,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         reports_dir=args.reports_dir,
         pytest_args=args.pytest_arg,
         timeout=args.timeout,
+        with_session_timing=args.with_session_timing,
     )
     print(f"[tileops-report] status={run['status']} report={run_dir / 'report.md'}")
     return exit_code

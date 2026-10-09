@@ -700,6 +700,218 @@ decided_by: evolver / human / -   # 裁决者
 - decided_by: -
 - decided_note: -
 
+## VP-2026-0119
+- type: D
+- title: reduce 混合 dtype（fp16 src→fp32 dst）静默产出错误极值——文档示例与实现矛盾（T.reduce_max.md §2.4 示例按实测产出垃圾值）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1/2：design_probe_argmax_dbg.py 变体 B（kern_mixed，fp16 输入 + fp32 规约输出）extreme=[0.75,117,13,−152] vs 真值 [3.09,2.81,3.98,2.89]，全部落 2^30 哨兵；Stage 2 实机重放复现（dbg-B 哨兵 / dbg-C 同 dtype PASS 对照）；对照 docs/Tilelang.language/规约操作/T.reduce_max.md §2.4（dtype≠accum_dtype 示例）与 §2.2.1——文档示例与实现矛盾
+- repro: repro-missing（知识域最小 repro 待同族任务回填；任务内复现命令见 evidence 末行 provenance 项）
+  - 〔provenance，允许失效〕任务内复现命令：python3 examples/argmax/_argreduce_kernel/history_version/design_probe_argmax_dbg.py（看 kern_mixed 输出行）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    add 条目 TRAP-reduce-mixed-dtype-silent-corrupt：T.reduce_max/T.reduce_min 的 dst dtype 与 src 不一致时静默产出错误极值（非 cast、非报错——fp16 src→fp32 dst 实测 extreme 全落 2^30 哨兵级垃圾值）；docs/Tilelang.language/规约操作/T.reduce_max.md §2.4 的 dtype≠accum_dtype 示例与实现矛盾（文档示例不可信）。配套纪律（bf16 面）：reduce dtype 表不含 bf16——bf16 输入先 T.vcast(..., round_mode="rint") 到 fp32 再 reduce。诊断指纹：极值列全落哨兵/异常量级 + 索引主路径正确 ⟹ 混合 dtype reduce 而非搬运/索引链缺陷。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: Stage 2 重放为同任务非独立证据（证据链追加性质）；capability-gaps 候选（文档示例错误类），暂不重复登记。
+
+## VP-2026-0120
+- type: D
+- title: bm=1 时 T.Parallel 融合循环条件引用 (·,1) 不变操作数被误 lower 为 arith.fptoui(f16→i1)——MLIR verify fail；先 T.vbrc 同形化修复；bm≥2 正常
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1：P2 首版编译失败 IR（`arith.fptoui` f16→i1 广播，/tmp 探针日志）；触发条件 `for i,j in T.Parallel(1,N): ite(x[i,j]==m[i,0],...)`（m 形状 (1,1)——条件中的 (·,1) 不变操作数）；vbrc 同形化（先 T.vbrc(m, ext) 展开）后 PASS；DESIGN.md §9.1-C-2
+- repro: repro-missing（知识域最小 repro 待同族任务回填；条件形态自包含于 delta）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    add 条目 TRAP-parallel-cond-unit-operand-fptoui：bm=1 的 T.Parallel 融合循环条件引用形状 (·,1)/(1,1) 的不变操作数（如 m[i,0] 与标量/布尔比较组合）时被误 lower 为 `arith.fptoui(f16→i1)` 广播——MLIR verify 编译期失败；bm≥2 同形态正常。绕法 = 先 T.vbrc 把 (1,1) 缓冲同形化展开到 (1,N) 再做元素对元素比较。与 TRAP-vbrc-same-shape-empty-broadcast（同形 vbrc 空广播维）构成 bm=1 形态族的两面：前者是「该 vbrc 而未 vbrc」，后者是「不该 vbrc 而 vbrc」。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: -
+
+## VP-2026-0121
+- type: D
+- title: shared 多消费者缓冲在 auto-multi-buffer 预算超限时静默数据竞争（非确定错误值跨 run 变化）+ 未用 T.alloc_fragment 不被 DCE——fragment 计算形态 + ≤64KB/block 手工预算双纪律
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1/2：design_probe_argmax.py p3c/p3d 首版（fp16/bf16 bm=2，shared 缓冲喂 ≥2 个算子 + 含未用 ext_brc）非确定 BIG 行 15–25/2048、3 run 变化（竞态指纹）；p3a/p3d/p3e fragment 版 3/3 稳定 PASS；DESIGN.md §4.5/§9.1-C-3/C-4；Stage 2 实机重放 p3a bm=2@hidden-state 3/3 稳定复证
+- repro: repro-missing（知识域最小 repro 待同族任务回填；任务内复现 = python3 history_version/design_probe_argmax.py --case p3d〔bm=2〕多 run 观察非确定 mismatch——provenance 允许失效）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-runtime.md
+- delta: |
+    add 条目 TRAP-shared-multiconsumer-silent-race：alloc_shared 缓冲被 ≥2 个算子消费（多消费者）且 auto-multi-buffer 双缓冲使预算超限时发生**静默数据竞争**——错误值非确定（同行跨 run 变化，15–25/2048 级），无报错无警告，是「最难查的一类」；同场实证：未用的 T.alloc_fragment 缓冲不被 DCE（计入 UB 规划挤占双缓冲预算）。规避双纪律：① 计算缓冲一律 alloc_fragment、alloc_shared 仅作 GM staging（bm/dtype 分派用独立 prim_func，不写「无条件 alloc + 条件使用」）；② 手工 UB 预算 ≤64KB/block（×2 双缓冲 = 128KB ≤ 184KB 可用）。诊断指纹：错误行数跨 run 变化 ⟹ 竞态（vs 全哨兵 = 匹配链断裂、固定行错 = 步长/索引）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0122（CONST-capacity 预算数据点）联动：本条是「超限后果」，该条是「超限阈值实测」。
+
+## VP-2026-0122
+- type: D
+- title: CONST-capacity-910B2C 追加 argmax 结构膨胀数据点——宽 N 1.60×/2.0×、窄内维 N<8 ~4×（(2048,4) bm=2048 手工 64KB→requires 256KB 溢出，bm=1024 通过）、bm=32@N_padded=256 ~2× 编译实证
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z：DESIGN.md §4.5 预算表（fp16 bm=4@4096 手工 160KB → requires 2097408 bits=256.03KB=1.60×；128KB→256KB=2.0×——宽 N 定标）；Stage 3 首跑 (4096,4)/(524288,4) fp16 bm=2048 手工 64KB → requires 2097408 bits（~4×，窄 N）编译溢出、降档 bm=1024 后 3/3 PASS；Stage 5 集成 run.json：bm=32@N_padded=256 手动预算 80KB、×2 约 160KB < 192KB 编译通过（latency 5145µs，profiler_valid=true）
+- repro: repro-missing（知识域最小 repro 待同族任务回填；任务内复现 = _select_config 阶梯复算 + 窄 N bm 阶梯 cap 逻辑——provenance 允许失效）
+- toolchain_stamp: tilelang 0.1.2（dev root build 2026-09-24 + 集成 013dbbf5）+ CANN 8.5.0 + Ascend910B2C / 2026-09-24~28
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/constants.md
+- delta: |
+    update 条目 CONST-capacity-910B2C（auto-multi-buffer 膨胀系数段）追加数据点：① 宽 N（N≥256）argmax 结构实测 1.60×（fp16 bm=4@4096：160KB→256.03KB）与 2.0×（128KB→256KB），与既有 ×1.7 量级互证；② **窄内维 N<8 膨胀 ~4×**（(2048,4) fp16 bm=2048：手工 64KB → requires 256KB）——窄 N 的扩展阶梯（小 N 大 M）预算解除不能沿用宽 N 的 64KB/block 口径（Stage 3 实测 bm 2048→1024 才过）；③ bm=32@N_padded=256 手动 80KB ×2 ≈160KB < 192KB 编译通过（集成环境实证）。交叉注记 TRAP-UB-multibuffer-inflation（膨胀条目）与 VP-2026-0121（超限静默竞态——预算红线不仅是编译溢出，超限先于溢出即竞态）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 数据点为多 attempt 汇总（设计探针 + Stage 3 首跑 + Stage 5 bench），同一任务内互证但非跨任务独立确认。
+
+## VP-2026-0123
+- type: D
+- title: TRAP-vbrc-same-shape-empty-broadcast 追加窄 N 垃圾索引形态——bm=1 vbrc (1,1)→(1,N) 在 N<8 产出垃圾/哨兵索引（N=2..6 全错、N=6→2^30），N=1 编译失败（同形空广播），N=8/bm≥2 正常
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 3：调试 (1,N) bm=1——N=8 PASS、N=2..6 FAIL（N=6 → 1073741824=2^30 全哨兵）、N=1 compile fail（empty broadcast dims，与 TRAP-vbrc-same-shape-empty-broadcast 同族）；bm=8 时 N=3/5 奇数窄列亦失败、N=4/8 通过；契约内最小 N=4 已由 L0-6 覆盖故未阻塞
+- repro: repro-missing（调试脚本在 /tmp 探针（可转正）；条件形态自包含于 delta）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    update 条目 TRAP-vbrc-same-shape-empty-broadcast（追加窄 N 形态段，原文保留）：除同形空广播维编译失败（N=1 形态）外，**vbrc (1,1)→(1,N) 在 N<8 时产出垃圾索引**（cand 全落 BIG 哨兵/错误 int64；N=6 实测全 2^30）——窄 N 向量化对 vbrc 广播与 candidate 循环的边界在 N=8；bm≥2 直接索引 + N=4 正常。窄 N（N<8）负载的候选索引构造避开 (1,1)→(1,N) vbrc 形态。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: -
+
+## VP-2026-0124
+- type: D
+- title: T.Parallel 内标量直接写 GM 输出张量元素（无 UB staging）产出错误值——同行 int64 主路径经 alloc_shared + T.copy 出栈正确（单次观察，待二次隔离证据）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 2：design_probe_argmax_dbg.py kern_same 的 `dbg[pid*bm+i,0] = T.cast(ext16[i,0],"float32")`（L69-70）重放输出 extreme=[-0.845,0.452,-1.135,-0.852] vs torch=[3.36,3.08,3.10,2.67] 而同行 ok=True（经 out_ub+T.copy 的索引主路径正确）；对照 kern_mixed 的 T.copy(ext32, dbg[...]) 导出路径（该变体错值来自混合 dtype reduce 非导出路径）
+- repro: repro-missing（隔离实验未做：把 dbg 改成 UB staging + T.copy 后是否恢复——单次观察，合入前需第二次隔离证据；任务内复现命令见 evidence provenance 项）
+  - 〔provenance，允许失效〕任务内复现命令：cd examples/argmax/_argreduce_kernel/history_version && python3 design_probe_argmax_dbg.py（看 [C-same] 的 extreme 行 vs ok 行）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    add 条目 TRAP-parallel-scalar-direct-gm-write（待二次隔离证据后合入）：T.Parallel 循环体内标量表达式直接写 GM 输出张量元素（无 UB staging）实测产出错误值；同一 kernel 内经 alloc_shared + T.copy 出栈的主路径正确。隔离归因待补：UB staging + T.copy 化后是否恢复（当前不排除与调试 buffer 布局的其他交互）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 提案源头（Stage 2 复盘）自标「单次观察，合入前需第二次隔离证据」——本条即按该口径入队等待。
+
+## VP-2026-0125
+- type: D
+- title: argreduce 边界语义三基准分野——torch-NPU 设备 argmax/argmin 对 ±0.0 用可区分全序（vs torch-CPU IEEE 相等首现）；NPU reduce 传播 NaN → 掩码匹配式输出哨兵 2^30（vs torch 首 NaN 索引）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1：探针实测（DESIGN.md §9.2-R1/R2）——`[0,-0,0]`→npu argmax=0/argmin=1、`[-0,0,-0]`→argmax=1/argmin=0，CPU 全 0（三 dtype 一致复现）；NaN 行 4 位形：NPU reduce 传播 NaN 使掩码匹配全失败 → 输出哨兵 2^30，torch 返首 NaN 索引；±inf 精确
+- repro: repro-missing（知识域最小 repro 待同族任务回填；±0.0 复现 = python3 -c "import torch,torch_npu; ..." 对照 CPU/NPU——provenance 允许失效）
+- toolchain_stamp: torch 2.x npu + CPU 对照 + tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-runtime.md
+- delta: |
+    add 条目 TRAP-argreduce-edge-semantics（golden 基准选择类）：① torch-NPU 设备 argmax/argmin 对 ±0.0 用**可区分全序**（argmax 偏好 +0.0、argmin 偏好 −0.0），与 torch-CPU（IEEE 相等取首现）不一致——跨设备 golden 对齐时 ±0.0 混合行是已知分歧点；② NPU 硬件 reduce 传播 NaN，掩码匹配式 argmax（vmax/vcmp 链）在 NaN 输入下全匹配失败输出哨兵 2^30，torch 返首 NaN 索引——含 NaN 的负载须在 L2/边界用例记录行为差（记录不断言崩溃），golden 选择与容差设计据此分野（torch-CPU golden / torch-NPU 设备实现 / 硬件 reduce 语义三方各不相同，设计期逐个实测记录比统一假设更诚实）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: -
+
+## VP-2026-0126
+- type: D
+- title: multitile bm>1 组合触发编译器 SIGSEGV（触发矩阵：bm=1 任意 tile ✓ / bm>1 单 tile ✓ / bm>1 多 tile ✗）——前次任务 repro 被清理后靠 pyc 考古恢复；CG-2026-0014 互链
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1：capability-gaps CG-2026-0014（本任务 §9.4-R9 补录——前次任务已登记但条目随工件清理丢失，源 repro .py 仅存 repro/__pycache__ pyc）；DESIGN.md §9.1-C-5 触发矩阵引用（本任务引用结论未复现崩溃本身）；pyc 反序列化 docstring 考古恢复路径见 Stage 1 复盘 Info-source 行
+- repro: repro-missing（源 repro 已清理仅存 pyc——重建触发矩阵三形态最小 kernel 待同族任务回填：bm=1 多 tile / bm>1 单 tile / bm>1 多 tile）
+- toolchain_stamp: 前次任务 2026-09-23（tilelang 0.1.2 dev build + CANN 8.5.0 + Ascend910B2C）；本任务引用环境 2026-09-24 同源
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    add 条目 TRAP-multitile-bm-gt1-segfault：num_tiles>1 的 T.serial tile 循环 + bm>1 组合触发编译器 SIGSEGV（rc 139，无报错文本）；触发矩阵：bm=1 任意 tile 数 ✓ / bm>1 单 tile ✓ / bm>1 多 tile ✗。绕法：tiled 路径强制 bm=1（工厂期保证）；小 M 大 N 负载改 N-split 两段 kernel（elementwise.md PL-1.20）。关联：capability-gaps CG-2026-0014（open）——本条使其进入 kb_search 检索域（本次知识流失-考古循环的教训：CG 登记簿不在 pattern-library 检索索引内，设计期 kb_search 查不到该陷阱）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0141（scaffolder 清理知识保全）联动：本条是清理致知识流失的实证案例。
+
+## VP-2026-0127
+- type: D
+- title: T.vcast f32→f32 非恒等（数据破坏 ~0.5 diff）——同 dtype 缓冲复制用 T.copy；前次任务 pyc 考古恢复
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1：repro/__pycache__ pyc docstring 考古（前次任务 2026-09-23 实证）；Stage 1 Transferable Lessons（「禁 T.vcast f32→f32（非恒等、数据破坏 ~0.5 diff）；同 dtype 缓冲复制用 T.copy」）
+- repro: repro-missing（知识域最小 repro 待同族任务回填——f32 buffer 经 T.vcast f32→f32 后与 T.copy 对照 diff）
+- toolchain_stamp: 前次任务 2026-09-23（tilelang 0.1.2 dev build + CANN 8.5.0 + Ascend910B2C）
+- target_doc: .agents/skills/tilelang-op-optimize/references/pattern-library/traps-compiler.md
+- delta: |
+    add 条目 TRAP-vcast-f32-f32-not-identity：T.vcast 在 src/dst 同为 f32 时非恒等——实测数据破坏（~0.5 量级 diff）；同 dtype 缓冲复制用 T.copy。与 TRAP-C12-copy-dtype-cast（T.copy 跨 dtype 静默转换）构成镜像对：「copy 换 cast 会静默变值」vs「cast 当 copy 用会静默坏值」。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 前次任务实证（经 pyc 考古恢复），本任务 Stage 1 消费未复现——证据链含考古 provenance。
+
+## VP-2026-0128
+- type: P
+- title: TileOPs reduce 族 Op 层 pad 契约与 host pad 消除——kernel 声明宽度须等于 Op 层 padded 宽度（错位症状：行 0 对、行≥1 全错不报错）；高杠杆项 = `_kernel_handles_padding=True` + kernel 原始 N 契约（小 N 负载最高 64× 流量改善）；argmin 共享 kernel 时 `_pad_value` 须 +inf
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 5：integration_log.md attempt-1（初次 report 17 failed 与 N_padded≠N 用例 100% 重合；最小复现：声明 (8,300) 喂 (8,300) 全对、Op 层 pad 到 (8,512) 后行 ≥1 全错——步长错位）；修复 = forward/__init__ 传 N_padded，42/42 通过
+  - host pad 消除证据：tileops/ops/reduction/reduce.py 模块注释（"until their kernels are converted"——仓库既定方向）+ DESIGN.md §0.6-R3/§5.5 + 前次任务 perf_opt/logs（3d 负载 ~195–204µs 主因 host pad，262KB/4KB 流量比）；Stage 5 集成 bench 对照：padded 路径 bm=32@N_padded=256 = 5145µs vs standalone 原始 N narrow 路径 12.5µs
+  - argmin 方向性：argmax.py wrapper __init__ 注释 + integration_log 遗留说明（-inf pad 永不赢 argmax、全 -inf 行 kernel 与 torch 同返 0；argmin 必须 +inf）
+- repro: repro-missing（集成契约需 TileOPs 环境；错位最小复现 = 构造 (8,300) fp16 输入，声明 (8,300) + Op 层 pad (8,512) 喂入 → 行≥1 错位——provenance 允许失效；知识域锚点 = cases.md CASE-argmax-argreduce-integration 已 Tier 0 合入）
+- toolchain_stamp: tilelang 0.1.2+ubuntu.22.4.npuir / Ascend910B2C / CANN 8.5.0 / git 013dbbf5 / 2026-09-28
+- target_doc: .agents/skills/tilelang-op-design/references/algorithm-candidates.md
+- delta: |
+    update ALG-reduction 行 R4 追加注记：**Op 层 pad 契约**——TileOPs reduce 族 Op 层默认把输入 pad 到 align_up(N,256)（`_ReduceOpBase._prepare_input`，`_kernel_handles_padding=False` 时）；kernel jit 声明宽度须取 N_padded（raw-N 契约与 F.pad 冲突症状：行 0 正确、行 ≥1 全错且不报错）；**迁移高杠杆项** = 翻转 `_kernel_handles_padding=True` + kernel 接原始 N（规约单位元 padding 语义上不改变结果），小 N/非对齐 N 的 dim=0/中间维负载最高 64× 流量改善（harness reduce.py 注释明示为仓库既定方向）；op_kind 涉及 min/max 的共享 kernel 须核对 `_pad_value` 方向性（argmax −inf 安全 / argmin 必须 +inf）。kb_links 补 CASE-argmax-argreduce-integration。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0134（design SKILL 集成前置核对）为同一发现的知识侧/流程侧两 Tier 拆分。
+
+## VP-2026-0129
+- type: P
+- title: reduction 族小 N 大 M 负载设计规则集——workload (M,N) 按 Op 层 reshape 规则推导（dim=0 → M=prod(其余)、N=该维长度）；block_m 由发射项决定 + 门控扩展阶梯 {16..2048}（窄 N 膨胀 4× 换算 + cap bm≤M）；tile_n 整除优先 + 裕度后置校正
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 2/revision/3/5：REVIEW.md 问题 1（v0 (512,4) 手抄 vs manifest+Op 层真值 (524288,4) 差 1024×——错误根因是抄错后无推导式可自检）；DESIGN.md v1 §5.2/§5.5（门控代码：基础阶梯 {1,2,4,8}〔GPU 48KB SMEM 承袭〕下 block 数 > 48×2 时启用 {16..2048} 档、UB 预算过滤器封顶——3d (524288,4) fp16：bm 8→2048、65536→256 block、发射项 4.8ms→18.7µs）；Stage 3 修正（bm=2048 窄 N 4× 膨胀溢出 → 实取 1024；(1,3)/(1,5) bm=8 垃圾行 → cap min(block_m,M)）；Stage 5 bench（bm=32@N_padded=256 编译通过）；tile_n 规则（DESIGN v1 §5.2：候选集 = N 因子 ∩ 256 倍数 ∩ ≤cap ∩ slab·elem·tn ≤ 0.9×UB_MANUAL_BUDGET 取最大，空集回退 cap+静态尾 tile——复现 lm-head fp16 5120 / bf16 4096）
+- repro: 纯工厂期算术复算（host 侧、设备无关）：65536/(4×8)=2048；ceildiv(524288,2048)=256；256×7op÷48×0.5µs≈18.7µs；反事实 ceildiv(524288,8)→≈4.8ms；factors(102400)≤6400 且 5×2×tn≤58982 → 5120
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C（发射常数 CONST-vector-launch-overhead）/ 2026-09-24
+- target_doc: .agents/skills/tilelang-op-design/references/algorithm-candidates.md
+- delta: |
+    update ALG-reduction 行 R4 追加小 N 大 M 负载设计规则集：① **(M,N) 推导**——manifest 负载一律按 Op 层 reshape 规则重算（dim=0/中间维 → M=除规约维外全维乘积、N=该维长度；movedim(dim,−1) 后 reshape），不按 x_shape 字面读（v0 差 1024× 实证）；② **bm 由发射项决定**——小 N 大 M 负载 UB 预算允许的 bm 远大于 GPU 承袭阶梯 {1,2,4,8}（block 数爆到数万、每 block 几个向量 op、0.5µs/op 发射主导：65536 block ≈4.8ms vs bm=2048 256 block ≈18.7µs）；门控扩展阶梯 {16..2048}（blocks > aicore×2 时启用）+ UB 预算过滤器封顶；**窄内维 N<8 的预算解除按 ~4× 膨胀换算**（宽 N 2× 口径在 (2048,4) 实测溢出，降档 1024 才过）且 **cap block_m = min(block_m, M)**（bm>M 尾行是 UB 未初始化垃圾、窄 N 下被向量化器污染有效行）；③ **tile_n 整除优先 + 裕度后置**——候选集 = N 的因子 ∩ 256 倍数 ∩ ≤ tile_n_cap ∩ slab·elem·tn ≤ 0.9×手工 UB 预算，取最大（零尾 tile + ≥10% 裕度）；空集回退 cap + 静态尾 tile（不依赖 compute_tile_n 的除数接受判据——其「除数优先」仅在不增加 tile 数时生效）。kb_links 补 CONST-vector-launch-overhead / VP-2026-0122（窄 N 膨胀）。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0044（row-reduction 基准形态，已合入）互补：0044 覆盖 N 可驻留的常规形态，本条覆盖小 N 大 M 与 N 超驻留两端的阶梯/分派规则。
+
+## VP-2026-0130
+- type: P
+- title: 调优迭代效率两手法——① 归因「二选一」嫌疑列表当轮用变体对照消歧（不留到后续轮——argmax 标量化归因跨轮证伪实证）② 高成本负载先微基准定标（copy-only 行宽-效率曲线 W≥32 渐近）再上真 shape 采数
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 4：opt_log Iteration 4（session-1 对 baseline 标量化留两个嫌疑〔(bm,1) 列广播操作数 / varange 生成失败〕未闭合，round 4 r4a 操作数变体对照一次证伪两者——真触发器是 2D T.Parallel(bm,N) 融合循环本身；证伪更正留痕 canonical §2-3）；Iteration 2（probe_gran copy-only 微基准定标行宽曲线：W=4→9.74µs / W=8→6.28 / W=16→5.56 / W=32→4.52µs，W≥32 达渐近线——r2a 窄行宽视图设计直接建立在该曲线上，避免真 shape 1632µs 负载多轮高成本采数）；SESSION_TIMING_ANALYSIS §3（诊断消歧并行化建议 + 3d baseline 采数最贵）
+- repro: none（方法类：判据与实例自包含于 delta；效应载体 = traps-compiler.md TRAP-parallel2d-bm-ge2-scalarize 证伪更正段）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24~28
+- target_doc: .agents/skills/tilelang-op-optimize/references/iteration-diagnosis.md
+- delta: |
+    add「迭代效率两手法」小节：① **嫌疑列表当轮消歧**——Phase 1 诊断产出「二选一」式归因嫌疑时，当轮即对每个嫌疑派一个操作数/形态变体实验分支做对照（各 ~1 分支成本），不跨轮次延迟：argmax 实证（session-1 两嫌疑留到 round 4 才由 r4a 变体对照双双证伪——若 round 1 当轮消歧，链式形态可提前 3 轮锁定；证伪更正按 canonical §2-3 留痕：误判根因 + 合法形态 + 新数据）；② **高成本负载微基准定标先行**——baseline 采数最贵的 workload（多 wave/读膨胀/诊断链长）先用更小的快速回归 shape 或 copy-only 微基准定标关键常数（行宽-效率曲线、膨胀系数），再上真 shape——argmax 3d 负载的窄行宽视图设计直接建立在 probe_gran W 曲线（W≥32 渐近 4.52µs/4MB）上，避免 1632µs 级负载的多轮盲扫。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: ①的实证即 TRAP-parallel2d-bm-ge2-scalarize 的证伪更正链（Stage 4 已回写知识侧），本条是其流程侧（当轮消歧纪律）的条目化。
+
+## VP-2026-0131
+- type: P
+- title: 索引输出 kernel 的失配行特征三指纹——全哨兵（2^30）= 匹配链断裂 / 跨 run 行数变化 = 竞态 / 全落 tile-0 局部索引 = loop-carried 状态未携带；int64 索引 torch.equal 精确比对是免费 oracle
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1/3：p3c/p3d shared 多消费者竞态（BIG 行 15–25/2048 跨 run 变化）；Stage 3 首跑 vselect 状态丢失（got=[4779,3248,2345,1833] 全落 tile-0 局部索引）；N=6 vbrc 窄 N（cand 全 2^30 哨兵）；Stage 3 复盘 Transferable Lessons（「失配行特征比数值回归更好定位根因」）
+- repro: none（指纹判据自包含于 delta；三个指纹的载体实例分别见 VP-2026-0121/TRAP-vselect-inplace-carried-state/VP-2026-0123）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-error-fixer/references/precision-patterns.md
+- delta: |
+    add 条目「索引输出 kernel 失配行特征三指纹」（置于定征顺序条目之后，互链）：argmax/argmin 类输出 int64 索引的 kernel，`torch.equal` 精确比对是免费 oracle（任何 tie-break/哨兵/状态携带 bug 立即暴露）；失配行的**空间与时间特征**先于逐元素排查定根因类别——① 输出全落哨兵值（2^30）⟹ 掩码匹配链断裂（NaN 传播 / vbrc 窄 N 垃圾）；② 错误行数跨 run 变化 ⟹ 竞态（shared 多消费者超预算）；③ 输出全落 tile-0/首块局部索引 ⟹ loop-carried 状态未携带（原位 vselect 类）；固定行错位（行 0 对行≥1 错）⟹ 步长/声明宽度错位。与 VP-2026-0006（定征顺序）、VP-2026-0038（误差结构定征）同族互补：本条是索引输出域的空间指纹版。
+- status: pending
+- confirmations: 1/2
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0061（lse 恒值指纹）同「错误指纹速查」族——合入时互链。
+
 ### Tier 2（R 类，结构化 diff 提案，待人工批准后 mode=apply 执行）
 
 ## VP-2026-0008
@@ -1451,6 +1663,7 @@ decided_by: evolver / human / -   # 裁决者
   - 交叉引用：queue VP-2026-0009（UB 预算混合字节口径——本条是其机械拦截位的形态扩展）
   - 〔2026-09-17 第二证（不同任务），task ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260917T035420Z〕design_calc_check 对该 DESIGN.md **两轮（v0/v1）均 skip 3/4**（ub_budget / l0c_budget / core_split），且 v1 §4.5 已含逐行 Bytes 列与「稳态峰值合计」行、§5.2 有 bl/bs/bp/bn 代码块、§5.5 有 w1–w4 逻辑核数列表仍全部无法解析——与 ada_layer_norm（N 分行驻留表形态）构成**两类表格形态的独立第二证**；REVIEW 只能人工复算（UB 115.25KB 逐项加和、L0C 16KB、逻辑核数 8/768/2560/16384）。机械拦截位（VP-2026-0009 类）连续两任务不生效，建议审批时把本条的 §5.5 workload 分核表解析与 ssd 的 w1–w4 列表形态并入 new 文本 2 的识别范围
   - 〔2026-09-20 第三现 + 新子缺陷，task ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260920T122332Z〕4 项检查 3 skip（ub_budget/l0c_budget/core_split——该任务 §4.3 多张 buffer 表 + §5.2 block 常量代码块 + §5.5 分核三要素列表均无法解析，仅 r3_metrics 生效，全靠人工复算兜底）；**新子缺陷**：l0c_budget 解析取 "block 64x128"（bn=128 被当 block_N），与真实 L0C acc [bl,bp]=[64,64] 不符（结论 pass 侥幸同向）——GEMM 类多 block 参数文档的维度取用需语义识别而非首个数值对，建议并入 new 文本 2 识别范围（优先匹配 alloc_L0C/L0C 容量句上下文中的 [bl,bp] 组合）
+  - 〔2026-09-28 第四现（不同任务，reduction 族）+ 两类新表形态，task argmax-_argreduce_kernel-20260924T031005Z〕design_calc_check 对该 DESIGN v0/v1 两轮检视 + v1 复审（同一任务三轮）ub_budget/core_split 全 skip，仅 r3_metrics 生效；人工复算 ~20 组数字（含 12 组分核算术）是发现膨胀系数数据点混用与 C1 缓冲区间漏 fp32 bm=1 的唯一途径。**两类新表形态**（建议并入识别范围）：① §4.5「B/elem 表 + 逐配置预算表」（列名含 手工预算/×2 双缓冲/结论）；② §5.5「逐 workload 分核表」（列名含 num_row_blocks/num_kernels/核内任务数）。REVIEW.md v0/v1 机械复核表（skip 三行 + 人工复算结论）。**合入优先级建议上调**：四任务（ada/ssd×2/argmax）连续命中，reduction 族最严重的阻塞项（workload (M,N) 差 1024×）正落在 skip 的 core_split 域——与 VP-2026-0136（--manifest 真值推导模式）互补：本条修「表解析」，该条补「真值来源」
 - repro: 复现条件——DESIGN.md 采用「按 N 分行的驻留预算表」（§4.5）或「workload 表格式分核表」（§5.5）形态时跑 design_calc_check 两个检查项（当前均 skip）
   - 〔provenance，允许失效〕任务内复现命令：python3 .agents/tools/design_calc_check.py check --design examples/ada_layer_norm/_ada_layer_norm_kernel/DESIGN.md
 - toolchain_stamp: design_calc_check.py 现行版本；失效环境 tilelang 0.1.2+a83118285a / 2026-09-10
@@ -1491,6 +1704,7 @@ decided_by: evolver / human / -   # 裁决者
 - evidence:
   - examples/ada_layer_norm/_ada_layer_norm_kernel/RETROSPECTIVE.md（Stage 2 Skill Flow Issues 第三行：reviewer 无法独立重放 NPUUtils 实查〔需设备连接〕，本次以设计实查记录 §5.5 + CONST-aicore-910B2C + lerp 同款查询三方交叉佐证放行）
   - .agents/skills/_shared/standards/core-split-strategy.md §1 ②（实查记录要求，无 reviewer 侧独立验证手段条款）
+  - 〔2026-09-28「有设备时直接重放」对照数据点，task argmax-_argreduce_kernel-20260924T031005Z〕reviewer 有设备场景：`NPUUtils.get().get_aicore_num()` = 24 于 v0 检视（05:15）与 v1 复审（06:34）两次独立重放一致；另五轮 Stage 1 探针实机重放（P1/P2/P2b/p3a×3/dbg，~12min）把 C-1~C-4 与冻结配置 bm=2 全部独立定证——「有设备优先重放实查、无设备走三证放行」的完整双分支口径（REVIEW.md v0 机械复核段 + Stage 2 复盘 VP 行，此前 VP 记录的是无设备分支）
 - repro: 只读核对（无运行时依赖）——reviewer 环境无 NPU 设备连接时核数实查不可重放的位形
 - toolchain_stamp: 流程规则（无运行时依赖）；证据环境 tilelang 0.1.2+a83118285a / 2026-09-10
 - target_doc: .agents/skills/_shared/standards/core-split-strategy.md
@@ -1513,6 +1727,7 @@ decided_by: evolver / human / -   # 裁决者
 - evidence:
   - examples/ada_layer_norm/_ada_layer_norm_kernel/RETROSPECTIVE.md（Stage 2 Value Point Proposals 首行：bf16 extreme-mod 案例逐输出 max_ulp=1 而 DESIGN §1.6.1 内嵌汇总格写 0——violation 计数与 EQUIV_PASS 判定不受影响，但「与内嵌表一致」的核对结论未逐格对上确界）
   - .agents/skills/tilelang-design-review/SKILL.md#L139（现行口径「执行结果须与 §1.6.1 内嵌结果表一致且全部 EQUIV_PASS」——「一致」未定义粒度）
+  - 〔2026-09-28 第二形态（不同任务）：行数粒度对账，task argmax-_argreduce_kernel-20260924T031005Z〕重跑 verify_equiv 的 per-item 行数（E3=33）与 DESIGN 内嵌表（40 行）不符而总数与结论一致——逐行核对发现行数差异记为建议级（不因总数相符跳过）；「一致」口径除上确界外还须覆盖**行数粒度**（内嵌表行数 vs 脚本输出行数），出处：该任务 Stage 2 复盘 Transferable Lessons 末条 + REVIEW.md 等价性段
 - repro: 复现条件——任一含内嵌汇总格的 verify_equiv 结果表重跑核对（汇总格 vs 逐案例输出上确界）
   - 〔provenance，允许失效〕任务内复现命令：python3 examples/ada_layer_norm/_ada_layer_norm_kernel/verify_equiv.py（bf16 段 extreme-mod 行 vs 内嵌表）
 - toolchain_stamp: torch CPU + tilelang 0.1.2+a83118285a / 2026-09-10
@@ -2306,6 +2521,7 @@ decided_by: evolver / human / -   # 裁决者
 - title: Stage 5 集成两防线——① wrapper `default_config` 与 kernel 内嵌 tuned 默认的口径衔接（翻转切换块激活 perf_opt 时同步核对，二者取一或标注口径差异）② 集成前工厂签名 diff 核对（零成本防线）
 - evidence:
   - task ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260917T035420Z：op 级 RETROSPECTIVE.md Stage 5——wrapper 脚手架 `default_config`（baseline 启发式硬编码 block_n=64/num_stages=3）在 perf_opt 激活后仍显式传参，覆盖调优版 kernel 内嵌 `TUNED_DEFAULT_CONFIG(block_n=128/num_stages=2)`（custom_op 显式传参优先级更高），Stage 4 tuned config 集成态不生效；integration_log.md「Bench 观察项 #2」（bench 输出 config 与 opt_log §final 不一致）+ 工厂签名核对段（`diff <(sed -n '/^def .../,/^):/p' ...)` 输出 SIGNATURE_IDENTICAL——签名逐参一致使 wrapper 胶水零改动完成切换）
+  - 〔2026-09-28 第二证（不同任务，reduction 族，wrapper 侧 GPU 启发式亚型），task argmax-_argreduce_kernel-20260924T031005Z〕Stage 5 集成：wrapper `default_config` 沿用 GPU 时代 `SHARED_MEMORY_BUDGET_BYTES=49152` smem 启发式选 bm=4，kernel 探针校准阶梯 `_select_config` 给 bm=2（含 min(block_m,M) 钳制与窄 N 预算减半，外部启发式均不掌握）——bm=4×4096 直接 `ub overflow, requires 2097408 bits while 1572864 bits available`；修复 = `default_config` 转调 `_select_config(self.M, self.N_padded, self.dtype_str)`，同一 report 42/42 通过（修复前后 run：20260928_024504 vs 20260928_030100）。诊断指纹：`ub overflow, requires N bits` 报文先查「谁传的 block_m、是否经 kernel 校准」。出处：examples/TileOPs/tileops/kernels/reduction/argmax/argmax_kernel/integration_log.md#attempt-1 + op 级 RETROSPECTIVE.md Stage 5 VP 行；工具侧联动见 VP-2026-0140（integrate_kernel.py 自动搬运 `_select_config` 成对 import——本次手工补行，翻转切换块时易漏翻）
 - repro: 复现条件——任一 perf_opt 激活态集成（wrapper default_config 显式传参 vs kernel TUNED_DEFAULT_CONFIG 内嵌默认的优先级差）
 - toolchain_stamp: tilelang npuir dev build（1990aa9fe4 谱系）+ CANN 8.5.0 / 2026-09-17
 - target_doc: .opencode/agents/tilelang-op-integrator.md
@@ -2494,6 +2710,7 @@ decided_by: evolver / human / -   # 裁决者
 - title: develop SKILL 两条——① Phase 3 golden 落盘形态 = 函数体内联 torch 计算（薄包装/别名导入被 S3-GOLDEN-TORCH AST 检查拒绝）② Phase 4 首跑建议 --level L0 单层（逐 shape 可见编译结果，定位后切 all）
 - evidence:
   - task ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260920T122332Z Stage 3：① gate 3 报 S3-GOLDEN-TORCH（薄包装 `return ssd_chunk_scan_fwd_ref(...)` 函数体无 torch.* 调用——attempt 1 白耗 742s）；内联仓内参考的 torch 计算（纯 fp32 einsum 双路径 + tril 掩码 materialize 照抄）后 pass: true；② L0 各用例 shape 不同触发多次编译、逐一可见 "AscendNPU IR compile success"（本任务 L0 首跑全绿省去分层二分）
+  - 〔2026-09-28 新亚型（不同任务，reduction 族），task argmax-_argreduce_kernel-20260924T031005Z Stage 3〕**张量方法形态**：golden 用张量方法 `x.argmax(dim=...)` 而非模块函数 `torch.argmax(x, dim=...)`——函数体同样无 `torch.*` 前缀调用，S3-GOLDEN-TORCH AST 检查判 fail（attempt 1 runtime fail 2731s → 修复 attempt 2 complete 70s，修法 = torch.* 命名空间直调）。建议 apply 时在 new 文本 1 的第 3 条补一句：「张量方法调用（`x.argmax`/`x.max` 等）同样不含 torch.* 前缀，须改写为 `torch.argmax(x, ...)` 模块函数直调（2026-09-28 argmax 实证：2731s 白耗）」；出处：examples/argmax/SESSION_TIMING_ANALYSIS.md §3 第 3 条 + .task_timeline.jsonl Stage 3 fail 事件
 - repro: 复现条件——① 迁移任务复用仓内参考函数作 golden（`import ... as` 别名与薄包装委托两种形态均被拒）；② 任一多 shape L0 套件首跑
 - toolchain_stamp: tilelang 0.1.2+4515de8 / CANN 8.5.0 / Ascend910B2C / 2026-09-20；gate_lint S3-GOLDEN-TORCH 现行版本
 - target_doc: .agents/skills/tilelang-op-develop/SKILL.md
@@ -2790,6 +3007,222 @@ decided_by: evolver / human / -   # 裁决者
 - created_by: task ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260921T120526Z 2026-09-21
 - decided_by: -
 - decided_note: -
+
+## VP-2026-0132
+- type: R
+- title: op-design SKILL D-3 探针纪律三条——① 预算口径补「同一探针文件的失败-修复迭代计入同一探针，总墙钟超限须在 DESIGN 附录如实记录」② 探针须覆盖冻结目标配置的规模挡位（多迭代 serial 循环 ≥3 次更新；小规模替代形状显式声明未覆盖维度）③ 探针执行 stdout tee 落盘 probe_logs + DESIGN 附录 A 增「日志路径」列
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1/2/3：① D-3 预算「≤2 个、每探针 ≤10min」按文件数合规但 8 轮 case 迭代总墙钟 ~25min（design_probe_argmax.py --case 逐轮演进，DESIGN 附录 A）；② tiled 在线递推探针只验了 num_full==2（P2 (3,700) tn=256 / P2b (96,8192) tn=4096），冻结配置 tn=5120→num_full=20 首跑才首次执行——原位 vselect 状态丢失 bug 恰在多迭代暴露（Stage 3 首跑 (4,102400) 输出全落 tile-0 局部索引）；③ Stage 1 探针无 stdout 落盘，Stage 2 交叉验证 C-1~C-4/C-8 只能重新在设备上跑（P1/P2/P2b/p3a×3/dbg 五轮 ~12min 墙钟）；无设备 reviewer 只能纸面接受声明（本轮探针窗口 2026-09-24 03:50–04:15 零 log 文件）
+- repro: 复现条件——任一设计期探针产出被 Stage 2 检视消费的场景（探针清单含多迭代循环结构 / 探针结论被交叉验证）
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-design/SKILL.md
+- delta: |
+    动作: update（D-3 段扩展，三处）
+    定位锚: "严格预算：**≤2 个探针、每探针 ≤10min**，只测未知常数（最小张量/最小 kernel），不实现完整算子；探针脚本落 `examples/{project}/{op}/history_version/design_probe_*.py`（供 gate 与检视核对）"
+    old 文本: （即上述定位锚原文）
+    new 文本: |
+      严格预算：**≤2 个探针、每探针 ≤10min**（同一探针文件的失败-修复迭代与逐 case 轮次计入同一探针预算；总墙钟超限时在 DESIGN 附录如实记录而非拆分文件规避），只测未知常数（最小张量/最小 kernel），不实现完整算子；探针脚本落 `examples/{project}/{op}/history_version/design_probe_*.py`（供 gate 与检视核对）。**规模挡位覆盖**：对方块循环本身有依赖的候选结构（loop-carried 状态 / 级联更新），探针须用**冻结目标配置的 tile 数/迭代数挡位**跑一遍（多迭代 serial 循环 ≥3 次更新）——小规模替代形状须显式声明其未覆盖的规模维度（argmax 实证：num_full=2 探针全过而 num_full=20 首跑暴露状态丢失）。**探针日志落盘**：探针执行 `tee` 到 `history_version/probe_logs/<case>.log`（含时间戳与工具链戳），DESIGN 附录 A 表增「日志路径」列——Stage 2 检视优先读日志比对，无日志且设备可用时重放、设备不可用时标注不可核验（argmax 实证：无落盘使 reviewer 五轮重放 ~12min / 纸面接受两分支都发生）；
+    动机: 三条缺口同源于「探针产出的可消费性」：预算口径可被文件数合规绕过、规模挡位缺口使 bug 逃逸到 Stage 3（2731s attempt）、日志缺失使检视要么重放要么盲信。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: ② 的消费侧（design-review SKILL「有 probe_logs 则先读日志比对」）随本条 new 文本一并生效，review SKILL 侧不再单独立案。
+
+## VP-2026-0133
+- type: R
+- title: op-design SKILL Phase 3 补「引用仓内既有 Python 原语必须 Read 实现核对参数单位与接受判据」——与 DSL API 查文档同纪律；附 compute_tile_n 参数口径实例（budget=字节 / num_buffers=同形缓冲个数 / elem_bytes=单缓冲元素字节 / 除数优先仅在不增加 tile 数时生效）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1 revision：v0 引用 `tileops/kernels/reduction/_primitives.py` 的 compute_tile_n 未读实现、凭参数名猜语义（budget 折元素数 + 再传 elem_bytes/num_buffers 二次折算）——fp16 lm-head 得 tile_n=512 而非 5120（tile 数 ×10），Stage 2 检视读 L110-196 实现才推翻（`per_buffer = block_m*elem_bytes; max_cols = budget // (num_buffers*per_buffer)`；`if div_tiles <= max_tiles: return best_dividing`）；复算：compute_tile_n(1,2,102400,256,6553,5)=512 vs budget=65536→6400；bf16 elem_bytes=2,num_buffers=7,budget=65536→4608+尾 tile（非零尾 4096）
+- repro: 复现条件——任一设计引用仓内 host 侧工具函数（_primitives.py 等）套用公式的场景；复算命令自包含于证据（纯 host 算术，与设备无关）
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 tilelang 0.1.2 dev root build 2026-09-24 / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-design/SKILL.md
+- delta: |
+    动作: update（Phase 3 信息收集章节补一条）
+    定位锚: "### Phase 3：信息收集"
+    old 文本: （即上述定位锚原文行——在该节 checklist 末尾追加）
+    new 文本: |
+      ### Phase 3：信息收集
+      （节内追加一条）**引用仓内既有 Python 原语（`_primitives.py` 等 host 侧工具函数）时必须 Read 其实现核对参数单位与接受判据**，与 DSL API 查文档同纪律——凭参数名猜语义是 1024× 级错误的来源之一（argmax 实证 2026-09-24：compute_tile_n 的 budget 为**字节**、num_buffers 为**同形缓冲个数**、elem_bytes 为单缓冲元素字节，预算先折元素数再传参会二次折算使 tile_n 512≠5120〔tile 数 ×10〕；其「除数优先」仅在**不增加 tile 数**时生效——bf16 返回 4608+尾 tile 而非零尾 4096，想要零尾 tile 须 wrapper 侧自有规则）。
+    动机: 「引 API 查文档」纪律只覆盖了 DSL API，漏了仓内 host 侧工具函数——v0 凭参数名猜语义导致 tile 数 ×10 的设计错误存活到 Stage 2 才被源码对账推翻。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 知识侧（wrapper tile_n 整除优先规则）已随 VP-2026-0129 入队 algorithm-candidates；本条为流程侧（Read 实现纪律 + 口径注记）。
+
+## VP-2026-0134
+- type: R
+- title: op-design SKILL DESIGN 产出要求补「集成前置核对」——reduce 族（及一切 Op 层有输入预处理的族）设计阶段必须确认目标 Op 层 `_kernel_handles_padding`/`_pad_value` 行为，kernel 声明宽度与 Op 实际传入宽度一致
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 5：集成前置核对只查 manifest test/bench 与 meta 一致性，未查 kernel 数据入口契约与 TileOPs Op 层 pad 行为一致性——DESIGN 冻结的 raw-N 契约（R3）与 `_ReduceOpBase._prepare_input` 的 F.pad(N_padded, -inf) 冲突直到 Stage 5 report 才暴露（初次 report 17 failed 全落在 N_padded≠N 用例，修复耗一整轮 integrator attempt）；tileops/ops/reduction/reduce.py#_prepare_input + integration_log.md#attempt-1
+- repro: 复现条件——任一 reduce 族（或 Op 层含 pad/reshape 预处理）算子的 harness 迁移设计
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 tilelang 0.1.2+ubuntu.22.4.npuir / git 013dbbf5 / 2026-09-28
+- target_doc: .agents/skills/tilelang-op-design/SKILL.md
+- delta: |
+    动作: update（DESIGN 产出 checklist / 交付清单段补一条）
+    定位锚: design SKILL.md「11. 交付清单」（Phase 4 checklist 段）
+    old 文本: （定位锚节内追加一条，apply 时按当时文件内容锁定精确锚）
+    new 文本: |
+      - **集成前置契约核对（迁移任务）**：设计阶段确认目标 TileOPs Op 层的输入预处理行为——reduce 族读 `tileops/ops/reduction/reduce.py#_prepare_input`（`_kernel_handles_padding=False` 时输入 pad 到 align_up(N,256)，kernel jit 声明宽度须取 N_padded；翻转 True + kernel 原始 N 是高杠杆优化项）；op_kind 涉及 min/max 的共享 kernel 须核对 `_pad_value` 方向性（argmax −inf / argmin +inf）。kernel 数据入口契约与 Op 层实际行为不一致 = Stage 5 集成期爆雷（argmax 实证 2026-09-28：17/42 failed，步长错位症状行 0 对、行≥1 全错且不报错）。
+    动机: 契约冲突在设计期是零成本核对（读一个 Op 基类文件），在 Stage 5 是整轮集成返工 + report 重跑；知识侧条目（CASE-argmax-argreduce-integration + VP-2026-0128）覆盖检索路径，本条把核对动作变成设计产出要求。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0128（知识侧，algorithm-candidates）同一发现的两 Tier 拆分；add-npu-op skill integrate 前置节为备选 target（审批时可改路由）。
+
+## VP-2026-0135
+- type: R
+- title: design-template.md 三条——§5.2 workload 表首列要求附 (M,N) 推导式（无推导式视为待确认）；§5.2 阶梯段补「扩展阶梯（小 N 大 M）预算解除用窄 N 实测膨胀系数（无实测按 4× 保守）+ 阶梯末 cap bm ≤ M」；§5.5 分核表增可选「反事实锚点」列（沿用最差合法配置的发射项对照）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1 revision/Stage 3：① v0 逐 workload 表数字手抄（无 M/N 推导算式）使 1024× 量级 shape 错误（512 vs 524288）存活到 Stage 2 三源交叉才推翻——错误根因不是算错而是抄错后无推导式可自检（revision Skill Flow Issue #1）；② §9.2-R10 预判 (2048,4) 窄内维未探针覆盖但冻结值仍取 bm=2048，首跑 auto-multi-buffer 4× 膨胀溢出（64KB→256KB）返工降档 1024（Stage 3 Skill Flow Issue #2）；block_m>M 时 (1,3)/(1,5) bm=8 尾行垃圾污染有效行；③ 反事实锚点实践：§1.6.0/§5.5 附「沿用最差合法配置的发射项」对照列（3d 行 bm=8→≈4.8ms），使「规模判定↔bm 取值↔发射估算」不自洽在纸面复算即可暴露（revision VP #4）
+- repro: 复现条件——任一含逐 workload 表 + bm 阶梯 + 分核表的 DESIGN 撰写/检视
+- toolchain_stamp: 流程规则（模板产出要求）；证据环境 tilelang 0.1.2 dev root build 2026-09-24 / 2026-09-24
+- target_doc: .agents/skills/tilelang-op-design/templates/design-template.md
+- delta: |
+    动作: update（三处）
+    定位锚 1: "### 5.2 Block 划分"
+    new 文本 1: 节内 workload 表说明追加：「逐 workload 表首列附 (M,N) 推导式（如 `dim=0: N=x.shape[dim]、M=prod(其余)`，按 Op 层 reshape 规则重算——movedim(dim,−1) 后 reshape），无推导式的行视为待确认」。
+    定位锚 2: "### 5.2 Block 划分"（阶梯/回退伪代码段）
+    new 文本 2: 阶梯段注记：「扩展阶梯（小 N 大 M）的预算解除须用**窄 N 实测膨胀系数**（宽 N 的 2× 口径在 N<8 实测 ~4×——(2048,4) bm=2048 手工 64KB→requires 256KB 溢出，降档 1024 通过）；无实测时按 4× 保守取值或直接取降档档位为冻结值；阶梯末 `block_m = min(block_m, M)`（bm>M 的尾行是 UB 未初始化垃圾、窄 N 下污染有效行）」。
+    定位锚 3: "### 5.5 分核策略（物理核数适配）⭐"
+    new 文本 3: 节内分核表说明追加：「可选『反事实锚点』列——逐 workload 附『沿用最差合法配置的发射项』对照（如 3d (524288,4) bm=8 → ≈4.8ms vs 选中 bm 2048 → ≈18.7µs），使规模判定↔bm↔发射估算的不自洽在纸面复算即可暴露；跨数字一致性约束（改善倍数 ≤ 流量缩减倍数）是免费 invariant」。
+    动机: 三条都把「设计期可机械核对的数值」变成模板硬要求——本任务三处失准（1024× shape / 窄 N 膨胀 / 发射项失配 86×）全部有纸面自检入口可拦。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 知识侧（阶梯规则本体）已随 VP-2026-0129 入队；本条为模板产出要求侧。窄 N 膨胀数据点见 VP-2026-0122。
+
+## VP-2026-0136
+- type: R
+- title: design_calc_check.py 增 `--manifest <yaml> --op <OpName>` 模式——按 Op 层 M/N 推导规则算出每条 workload 的 (M,N) 真值，与 DESIGN §5.2/§5.5 表的 shape/block_m/num_row_blocks/核内任务数逐格 diff；design-review SKILL Phase 1 机械复核段加该调用
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 2：最严重阻塞项（3d-non-last-axis 写成 (512,4)，manifest+Op 层真值 (524288,4)，差 1024×）只能靠人工「manifest workloads → `_ReduceOpBase._prepare_input` 的 M/N 推导（dim=0 → M=除规约维外全维乘积）」两步交叉推出；design_calc_check 的 core_split 检查因解析不到维度直接 skip（`"status":"skip","detail":"insufficient parsed dims {}"`）——shape 正确性完全交给 LLM 复核（REVIEW.md 问题 1）
+- repro: 复现条件——任一 harness 迁移 DESIGN 的 workload 表机械核对；复算规则自包含（dim=0/中间维 → M=prod(其余)、N=该维长度）
+- toolchain_stamp: design_calc_check.py 现行版本；失效环境 tilelang 0.1.2 dev root build 2026-09-24 / 2026-09-24
+- target_doc: .agents/tools/design_calc_check.py
+- delta: |
+    动作: update（新增 CLI 模式 + 调用点）
+    定位锚 1: design_calc_check.py CLI 参数解析段（现有 --design 模式旁增 --manifest/--op）
+    new 文本 1: 新增模式：`python3 .agents/tools/design_calc_check.py check --design <DESIGN.md> --manifest <manifest.yaml> --op <OpName>`——按 Op 层 reshape 规则（含 `_prepare_input` 的 pad/N_padded 推导）算出每条 workload 的 (M,N) 真值，与 DESIGN §5.2/§5.5 表逐格 diff（shape/block_m/num_row_blocks/核内任务数）；不匹配即 fail 并打印真值推导式（manifest workload 行 → movedim/reshape → (M,N)）。
+    定位锚 2: .agents/skills/tilelang-design-review/SKILL.md Phase 1「算术复算」调用行
+    new 文本 2: 机械复核调用扩展为含 --manifest 模式（harness 任务 manifest 可得时必跑）。
+    动机: 1024× 级 shape 错误是本任务 3 项 Stage 1 修订之首（返工成本 7666s：Stage 1 fail+定点修复 + Stage 2 首检不通过）；真值来自 manifest + Op 层规则而非 LLM 复读——与 VP-2026-0047（表形态解析）互补：0047 修「设计表读得进」，本条补「真值算得出」。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0047 联动（其第四现证据即本任务）；合入顺序建议 0047 先（表解析）或同批。
+
+## VP-2026-0137
+- type: R
+- title: core-split-strategy.md 补 N 向分核（N-split）谓词——分核三要素表与 §2.1/§2.4 透传文本当前只覆盖 M 向分核；小 M 大 N 负载（M≤16 且 M<核数 且 N≥32768 且 N%256==0）应路由到 N-split 两段 kernel 结构，配套实验裁决三件套（分派谓词 + 判定阈值 + 回写路径）作为 §1.6.4 落地范例
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 4 + [DESIGN_LIMIT]：lm-head 类 (4,102400) 单 kernel 主选被 C-5（multitile bm>1 SIGSEGV）钉死 bm=1 → 4/48 核、实测贴 4 核 MTE2 聚合带宽地板；预注册 C6 N-split 备选 A/B 裁决 2.20×/2.60×（0.461×/0.386×，均 « 0.8× 翻转阈值）结构性胜出并采纳（perf_feedback.md [DESIGN_LIMIT] 双门槛达成；DESIGN §1.6.4 实验裁决三件套在续跑会话直接闭环——预注册价值实证）；elementwise.md PL-1.20（Stage 4 已回写结构形态）；遗留：DESIGN §1.4/§3.3 正式化走设计修订路由
+- repro: 复现条件——任一 row-reduction 族含小 M 大 N 负载的设计（lm-head 形态）；结构形态与 tn 规则见 PL-1.20（知识域）
+- toolchain_stamp: tilelang 0.1.2 dev root build 2026-09-24 + CANN 8.5.0 + Ascend910B2C / 2026-09-24~28
+- target_doc: .agents/skills/_shared/standards/core-split-strategy.md
+- delta: |
+    动作: update（两处）
+    定位锚 1: "## 1. 分核策略三要素（Stage 1 门禁核对项）"
+    new 文本 1: 节末追加：「**N 向分核（N-split）**：M 向分核对 M < 核数的小 M 大 N 负载（lm-head 形态，M≤16 且 M<物理核数 且 N≥32768 且 N%256==0）失效（核利用率钉死 M/48）——此类负载路由到 N-split 两段 kernel（partial 按 chunk 分核 + merge 单 block，结构见 pattern-library elementwise.md PL-1.20）；分派谓词静态可判，判定阈值（端到端 < 0.8× 主选即翻转）与回写路径（§1.4/§3.3 修订 + Stage 2 复审）按实验裁决三件套预注册（argmax 实证 2026-09-28：2.20×/2.60× 翻转）」。
+    定位锚 2: "### 2.4 Stage 4 — optimizer 调优提示（透传文本）"
+    new 文本 2: 透传文本补一句：小 M 大 N 负载的单 kernel 地板归因（核利用率 M/核数 + 带宽贴地）时，核对设计是否预注册 N-split 备选裁决；未预注册且结构性天花板明确（>2× 估计）→ 触发 [DESIGN_LIMIT] 路由。
+    动机: 分核标准只覆盖 M 向使设计期对小 M 大 N 负载无标准入口；本任务靠 §1.6.4 自建三件套才闭环——预置谓词使同族算子（ArgminFwdOp 等）设计期直接命中。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 知识侧结构形态已 Tier 0（PL-1.20 + CASE-argmax-argreduce-stage4）；本条为分核标准/流程侧。
+
+## VP-2026-0138
+- type: R
+- title: design-review SKILL Phase 2 复审纪律两条——① 复审场景上一轮 REVIEW.md 的文档引文/实测数字一律视为待核工件（阻塞修复涉及的支持面论断必须重读原文档，不得 diff 两版 REVIEW 文本代替取证）② 阻塞修复涉及的数值及其派生量在 DESIGN 全文检索所有出现点并逐处同口径重算（「修订说明列出的章节」≠「受影响的全部章节」）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 2 复审：① v0 REVIEW 引用 T.transpose.md §2.2.1 dtype 表把 uint32 写成 √（文档实际 ×），v1 DESIGN 更正复述与 v0 REVIEW 引文冲突，复审重读原文才裁定 v1 准确——若沿用前轮引文会误判 v1「引入新错误」；② v1 定点修订在未改动章节留下三处数字残留（附录 A 262KB〔应 268MB〕/ §9.2-R8 32768B〔应 28672B〕/ §5.2 269MB〔应 272.6MB〕），靠全文 grep + 逐处重算才捕获（REVIEW.md v1 复审维度 2/3/7 N2/N3/N4）
+- repro: 复现条件——任一 Stage 1 revision 后的 Stage 2 复审（阻塞修复核验场景）
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 2026-09-24
+- target_doc: .agents/skills/tilelang-design-review/SKILL.md
+- delta: |
+    动作: update（Phase 2 复审要点段追加两条）
+    定位锚: "### Phase 2：逐维度检视"
+    old 文本: （该节复审要点 checklist 处追加，apply 时按当时文件锁定精确锚）
+    new 文本: |
+      - **复审的「独立」= 证据重新取证，不是文本 diff**：上一轮 REVIEW.md 的文档引文/实测数字一律视为待核工件——阻塞修复涉及的支持面论断（dtype/shape 表、限制条款）必须重读原文档（argmax 实证 2026-09-24：v0 REVIEW 的 dtype 表引文错一列 uint32，沿用会误判 v1 修复引入新错误）；DESIGN 修订说明只当索引用。
+      - **阻塞修复的数字体系全文同口径重算扫描**：对每个修复涉及的数值及其派生量（比例/裕度/合计）在 DESIGN 全文检索所有出现点并逐处重算——定点修订的残留高发于修订说明未覆盖的相邻章节（argmax 实证：3 处残留全部在未修订章节）。
+    动机: 复审若以「diff 两版文本」代替取证会把前轮引文错误传染为对修复的误判；数字残留的捕获成本（全文 grep）远低于流出到 Stage 3。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0094（引用抄录一手来源）互补：0094 管设计侧引用，本条管复审侧取证。
+
+## VP-2026-0139
+- type: R
+- title: design-review SKILL 检查项三则——① 维度 8 弃选论证 dtype/shape 支持面论断须同时核对所引文档表与 pattern-library 条目 `dtype:`/`status:` front-matter（实测口径比文档表更强）② 「依赖未实证常数」判定前先检索 `perf_opt/logs/` 该备选的终版日志（不只看首版反例）③ 维度 3 增「冻结工厂逻辑的分支可达性 + 预算口径一致性」核对点（阶梯/回退逐分支代入边界值）
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 2：① 设计称 T.transpose dtype 限 fp16，被 T.transpose.md §2.2.1 与 pattern-library PL-1.1 front-matter `dtype: [fp16, fp32, bf16] / status: verified` 双双反驳——现有 skill 文本只点名「dtype 矩阵」未提示核对 pattern-library 实测口径（REVIEW 问题 3）；② 设计引 round8_op9 首版 4/4 mismatch 论证 C6 风险，漏引同 log 族 round9 终版（partial ≈15.7µs + merge ≈1.7µs golden PASS）——该数字正是 C6 收益常数的现成实测，直接改变「未实证常数」判定（REVIEW 问题 S5）；③ v1 阶梯伪代码 p=1 档死分支（`block_m is None and N×B_bm1 ≤ budget` 恒不可达）+ 契约外 N 区间选中 bm=1 驻留但实际 alloc 超自设安全预算（fp32 N=5000：60000≤65536 过滤通过，实际 bm=1 alloc 80000B > 64KB 纪律线）——分支可达性推演 + 边界 N 代入口径核对可纸面判定（复审 VP #1）
+- repro: 复现条件——任一含弃选论证/实验裁决计划/工厂期阶梯伪代码的 DESIGN 检视
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 2026-09-24
+- target_doc: .agents/skills/tilelang-design-review/SKILL.md
+- delta: |
+    动作: update（三处）
+    定位锚 1: 维度 8 表「向量化轴与布局决策完整性」行的「弃选论证前提核对」句（"...每个弃选候选的 repack/代价机制前提必须与所引 API 文档亲自核对一致..."）
+    new 文本 1: 该句尾追加：「dtype/shape 支持面论断须同时核对所引文档的 DataType 表**与** pattern-library 对应条目的 `dtype:`/`status:` front-matter（实测口径比文档表更强）；两者任一矛盾 → fail（argmax 实证：T.transpose 文档表与 PL-1.1 front-matter 双源反驳设计声称的 fp16 限制）」。
+    定位锚 2: 维度 8 表「实验裁决模式完整性」行（"判定裕度依赖未实证常数时"句）
+    new 文本 2: 该行判定口径追加：「备选被判『依赖未实证常数』时，先在 `perf_opt/logs/`（同算子前次任务或本任务早期）按 candidate/round 名检索该备选的**终版**日志——首版 mismatch 与终版 golden PASS 可能并存于同一 log 族，已有实测则该常数不再是未实证（argmax 实证：round9 终版 partial/merge µs 直接改变 C6 判定）」。
+    定位锚 3: 维度 3（Tiling 策略）检查项表
+    new 文本 3: 增检查点：「冻结规格中的工厂期选择逻辑（阶梯/回退/分派伪代码）做**分支可达性 + 预算口径一致性**分析：每条分支代入边界值走一遍（死代码 = 恒不可达分支；口径漂移 = 过滤器用 A 口径而 alloc 用 B 口径——如 p=1 档用 B_bm1 核算而实际 alloc 按 B_multi）——选定值对契约内形状正确不代表选择函数对契约外形状守纪律」。
+    动机: ①② 都是「证据源完整性」缺口（文档表 ≠ 全部证据源；首版反例 ≠ 全部日志）；③ 是「选定值正确 ≠ 选择函数正确」的覆盖层缺口。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: ①与 Phase 1 第 5 步「弃选论证查证（强制）」的 pattern-library 对照条款衔接（该步已要求对照 pattern-library——本条把 front-matter dtype/status 字段明确为核对对象并绑定 fail 判据）。
+
+## VP-2026-0140
+- type: R
+- title: integrate_kernel.py gen_kernel_source_block 检测 kernel 模块内被 wrapper 消费的模块级 helper（`_select_config` 等）自动生成成对 baseline/perf_opt import 行——当前只搬运 extracted_functions 名单内的 kernel factory
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 5：wrapper 胶水需要 `_select_config`（kernel 探针校准阶梯）时只能手工加行；本次手工补 `_select_config` 成对行（tileops/kernels/reduction/argmax/argmax.py import 块）；integrate_kernel.py#gen_kernel_source_block（L275 起）仅按 extracted_functions 名单生成行；perf_opt 采纳翻转时易漏翻（integration_log 遗留说明：「翻转 import 时须同步翻转 _select_config 行」——人工记忆依赖）
+- repro: 复现条件——任一 kernel 模块含模块级 helper 且 wrapper default_config 消费它的集成/翻转场景；重跑 integrate_kernel.py 覆盖集成副本后 helper import 行消失
+- toolchain_stamp: tilelang 0.1.2+ubuntu.22.4.npuir / git 013dbbf5 / 2026-09-28；integrate_kernel.py 现行版本
+- target_doc: examples/TileOPs/.agents/skills/add-npu-op/scripts/integrate_kernel.py
+- delta: |
+    动作: update（gen_kernel_source_block 逻辑扩展）
+    定位锚: integrate_kernel.py#L275 def gen_kernel_source_block（按 extracted_functions 名单生成 import 行的循环体）
+    old 文本: （按名单生成 kernel factory import 行的现行逻辑）
+    new 文本: |
+      生成 import 行前对 kernel 源模块做静态扫描：模块级 `def _select_config`（及其他被 wrapper 模板引用的 helper 约定名单）存在时，自动生成成对 baseline/perf_opt import 行（与 kernel factory 行同步翻转注释态）；扫描不到则维持现状。
+    动机: wrapper config 权威已确立为 kernel 校准阶梯（VP-2026-0093 argmax 第二证：GPU 启发式直接 ub overflow）——helper import 成对性靠手工维护是翻转漏翻的已知隐患点。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 与 VP-2026-0055（gen_kernel_source_block stem fallback 缺陷）同函数域不同缺陷，合入时互检；与 VP-2026-0093/0074（config 契约族）联动。
+
+## VP-2026-0141
+- type: R
+- title: 脚手架/工件清理流程的知识保全规则——同算子重迁移（Stage 0 脚手架重建工作区）不得清理 `examples/{op}/{func}/repro/*.py` 与 capability-gaps 登记条目；跨任务同算子知识继承路径（perf_opt/logs + repro + CG）在 scaffolder 流程显式化
+- evidence:
+  - task argmax-_argreduce_kernel-20260924T031005Z Stage 1：前次同算子任务的工具链陷阱知识几乎流失——capability-gaps 曾有 CG-2026-0014 登记（trap docstring 自称已登记）但条目丢失；repro .py 源码被清理仅存 `repro/__pycache__/*.pyc` 与 `perf_opt/logs/`；本次靠 pyc 反序列化 docstring + perf 日志考古才恢复两条关键陷阱（multitile bm>1 segfault / vcast f32→f32 corrupt）与性能校准数字（hidden-state fp16 bm=2/bf16 bm=1 终选值与前次完全互证）（Stage 1 复盘 Info-source 行 + DESIGN §9.4-R9 补录记录）
+- repro: 复现条件——任一同算子二次迁移任务开始时检查前次 repro/*.py 与 CG 登记的存活状态
+- toolchain_stamp: 流程规则（无运行时依赖）；证据环境 2026-09-24（前次任务工件 2026-09-23）
+- target_doc: .opencode/agents/tileops-scaffolder.md
+- delta: |
+    动作: update（执行流程补知识保全条款）
+    定位锚: tileops-scaffolder.md「## 执行流程」段（S1-S7 移植步骤列表）
+    old 文本: （该流程段末尾追加，apply 时按当时文件锁定精确锚）
+    new 文本: |
+      6. **前次任务知识保全（同算子重迁移）**：Stage 0 重建/清理工作区时**保留** `examples/{op}/{func}/repro/*.py`（知识域 repro 源）、`examples/{op}/{func}/perf_opt/logs/`（实测锚点）与 `.agents/evolution/capability-gaps.md` 登记条目（不随源码清理）；重迁移 prompt 中附「前次任务知识入口」清单（repro 文件名 + CG gap_id + 校准数字出处），供 Stage 1 设计期直接消费而非 pyc 考古（argmax 实证 2026-09-24：清理致知识流失，恢复成本一整段设计期探针预算）。
+    动机: repro/CG 是跨任务知识载体，清理使下一次迁移从零考古；perf_opt/logs 与 repro 的「金矿」价值（校准值互证、失败反例、终版正例）依赖其存活。
+- status: pending
+- confirmations: -/-
+- created_by: task argmax-_argreduce_kernel-20260924T031005Z 2026-09-28
+- decided_by: -
+- decided_note: 清理动作的实际执行方若不在 scaffolder（如 conductor Stage 0 编排或脚本），apply 时改路由至实际 owner；与 VP-2026-0117（终态产物保全）/ VP-2026-0102（迁移重做 git-show 核对）互补三件。
 
 ## Decided（merged / rejected / expired / conflict 归档）
 

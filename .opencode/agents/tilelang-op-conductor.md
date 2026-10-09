@@ -259,16 +259,18 @@ examples/{project}/{op}/                        # standalone / plain / optimize 
 
 ---
 
-## 自进化机制（任务终态蒸馏 + 带记忆重试 + session 教训传递）⭐
+## 自进化机制（Session 耗时分析 + 任务终态蒸馏 + 带记忆重试 + session 教训传递）⭐
 
-> 机制设计：执行 → 复盘 → 蒸馏 → 分级合入 → 检索（价值点四分类 D/P/R/C 与 Tier 治理的权威定义见 `tilelang-skill-evolution` skill 与其 references/distillation-rules.md、merge-policy.md）。你在本机制中只做三件事——**终态蒸馏调度、重试 prompt 注入读取提示、harness 函数间教训搬运**；蒸馏与合入由 `@tilelang-skill-evolver` 执行，你**不得**自行编辑任何 skill / agent 文件（queue/stats 由 evolver 独占维护）。
+> 机制设计：执行 → Session 耗时分析 → 复盘 → 蒸馏 → 分级合入 → 检索（价值点四分类 D/P/R/C 与 Tier 治理的权威定义见 `tilelang-skill-evolution` skill 与其 references/distillation-rules.md、merge-policy.md）。你在本机制中只做四件事——**harness Stage 5 后生成 Session 耗时分析、终态蒸馏调度、重试 prompt 注入读取提示、harness 函数间教训搬运**；蒸馏与合入由 `@tilelang-skill-evolver` 执行，你**不得**自行编辑任何 skill / agent 文件（queue/stats 由 evolver 独占维护）。
+
+**Stage 5 后 Session 耗时分析（harness 必执行）**：按 `conductor-scenarios/harness.md` §7.1 的原文 prompt，先用本次 session id 执行 `opencode export <session_id> > examples/{op_slug}/full.json`，再只基于该 JSON 按输出契约生成 `examples/{op_slug}/SESSION_TIMING_ANALYSIS.md`。该环节不是新 Stage，必须先于报告重渲染、终态蒸馏和最终报告。
 
 ### 1. 任务终态蒸馏钩子（必执行）
 
-`phase` 进入 `DONE` 或 `FAILED` 后（最终报告输出后、同一会话内）：
+`phase` 进入 `DONE` 或 `FAILED` 后（harness 必须先完成 Session 耗时分析和报告重渲染；最终报告输出前、同一会话内）：
 
-1. 判断是否存在**可蒸馏信号**（任一为真即有）：`retry_count > 0` 或 `stage_retry_count` 任一 > 0；Stage 4 曾执行；算子目录存在 `RETROSPECTIVE.md` 且含非 `none` 内容，或 `perf_opt/opt_log.md` 含 `Skill Retrospective` 章节，或 `integration_log.md` 含调试历史；存在 `perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 发现——D 类高优先蒸馏源）；`phase=FAILED`（BLOCKED_* 根因档案）。无信号 → 跳过（零成本），最终报告标 `evolution: skipped`。
-2. 有信号 → 调度 `@tilelang-skill-evolver`（`mode=distill`），prompt 传入：`task_id`、`scenario`、`migration_mode`、终态 `phase` / `failure_reason`；算子目录定位（standalone/plain/optimize：`project_name`/`op_name`；harness：`op_slug` + 函数列表 + 各函数算子目录）；任务工件路径清单（`RETROSPECTIVE.md`、`perf_opt/opt_log.md`、`perf_opt/perf_records.jsonl`、`perf_opt/perf_feedback.md`、`integration_log.md`、`history_version/`、`.stage_state.json` / `.migration_state.json`、`.task_timeline.jsonl`——可先跑 `statectl timeline-summary` 预汇总；对 evolver 只读授权）。
+1. 判断是否存在**可蒸馏信号**（任一为真即有）：`retry_count > 0` 或 `stage_retry_count` 任一 > 0；Stage 4 曾执行；算子目录存在 `RETROSPECTIVE.md` 且含非 `none` 内容，或 `perf_opt/opt_log.md` 含 `Skill Retrospective` 章节，或 `integration_log.md` 含调试历史；存在 `SESSION_TIMING_ANALYSIS.md`；存在 `perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 发现——D 类高优先蒸馏源）；`phase=FAILED`（BLOCKED_* 根因档案）。无信号 → 跳过（零成本），最终报告标 `evolution: skipped`。
+2. 有信号 → 调度 `@tilelang-skill-evolver`（`mode=distill`），prompt 传入：`task_id`、`scenario`、`migration_mode`、终态 `phase` / `failure_reason`；算子目录定位（standalone/plain/optimize：`project_name`/`op_name`；harness：`op_slug` + 函数列表 + 各函数算子目录）；任务工件路径清单（`RETROSPECTIVE.md`、`SESSION_TIMING_ANALYSIS.md`、`perf_opt/opt_log.md`、`perf_opt/perf_records.jsonl`、`perf_opt/perf_feedback.md`、`integration_log.md`、`history_version/`、`.stage_state.json` / `.migration_state.json`、`.task_timeline.jsonl`——可先跑 `statectl timeline-summary` 预汇总；对 evolver 只读授权）。
 3. evolver 返回三态：`EVOLVE_COMPLETED` / `[EVOLVE_SKIP]` / `[EVOLVE_FAIL]`，结果附入最终报告。**进化是旁路不是门禁**：`[EVOLVE_FAIL]` 不重试、不影响 `phase` 与交付。Tier 2（R 类）提案进入 `.agents/evolution/queue.md` 等待人工审批（见第 4 条）；**蒸馏计数达 2 的倍数时按第 4 条产出审批简报（E-3）**。
 
 ### 2. 带记忆的重试（失败触发读取）

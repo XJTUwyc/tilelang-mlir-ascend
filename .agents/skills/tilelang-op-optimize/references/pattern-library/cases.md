@@ -322,3 +322,37 @@ capability-gaps 登记簿（`.agents/evolution/capability-gaps.md`）open 条目
 | CG-2026-0012 | BishengIR（auto-multi-buffer 动态 subview 支配性） | 动态偏移 UB subview 进嵌套循环产出非支配 IR |
 
 > BLOCKED 终态任务的反例根因链条目同入本节（由 evolver 追加，标注「反例」）。
+
+---
+id: CASE-argmax-argreduce-stage4
+kind: case
+family: [reduction]
+apis: []
+dtype: [fp16, bf16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro-missing
+---
+
+### argmax/_argreduce_kernel Stage 4 完整档案（C6 预注册裁决翻转 + 证伪更正）
+
+几何平均 11.5×（lm-head 2.20×/2.60× C6 N-split 翻转、hidden-state 5.8×/4.4× 链式+arange 修复、3d 130× 窄行 deinterleave）。要点：①DESIGN §1.6.4 实验裁决三件套（结构+阈值+回写路径）在续跑会话直接闭环——预注册的价值实证；②session-1 标量化归因被操作数变体对照证伪（TRAP-parallel2d-bm-ge2-scalarize）；③C6 双 kernel 的 msprof 口径 = 两段 Task Duration 之和（--kernel-name 分别捕获）。工件（工作区过程文件，任务级溯源）：examples/argmax/_argreduce_kernel/perf_opt/opt_log.md（[DESIGN_LIMIT] 双门槛达成：2.20×>2× + 设计层归因）；知识域证据见本库 repro/repro_nsplit_pattern.py 等六件。
+
+---
+id: CASE-argmax-argreduce-integration
+kind: case
+family: [reduction]
+apis: []
+dtype: [fp16, bf16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2+ubuntu.22.4.npuir / Ascend910B2C / CANN 8.5.0 / git 013dbbf5
+repro: repro-missing
+---
+
+### TileOPs reduce 族集成契约参考（argmax 首集成的胶水修复档案）
+
+`examples/TileOPs/tileops/kernels/reduction/argmax/argmax_kernel/`（任务级溯源，允许失效——集成包为任务交付件，未随知识库演进存活；integration_log.md + wrapper `argmax.py` + history_version/argmax_s5_attempt1.py 修复前备份）。触发条件：任一 reduce 族算子接入 TileOPs（ArgminFwdOp 等共享 ArgreduceKernel 的迁移单元前置阅读）。要点：① Op 层 `_ReduceOpBase._prepare_input` 在 `_kernel_handles_padding=False` 时 pad 到 align_up(N,256)——kernel jit 声明宽度须取 N_padded（raw-N 契约与 Op 层 F.pad 冲突的症状：行 0 正确、行 ≥1 全错且不报错，初次 report 17 failed 与 N_padded≠N 用例 100% 重合）；② wrapper `default_config` 转调 kernel 模块 `_select_config`（GPU 时代 smem 启发式选出的 block_m 在新 kernel 上直接 `ub overflow, requires 2097408 bits while 1572864 bits available`）；③ argmax 语义 -inf pad 与首现索引兼容（全 -inf 行 kernel 与 torch 同返 0），argmin 共享 kernel 时 `_pad_value` 须为 +inf；④ 修复后 42/42 + benchmark 5 case 全有效（run.json 20260928_030100_974855）。

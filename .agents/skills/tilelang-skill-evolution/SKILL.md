@@ -1,6 +1,6 @@
 ---
 name: tilelang-skill-evolution
-description: "TileLang-Op-Conductor 自进化机制执行 skill，由 tilelang-skill-evolver 调用。任务终态从任务工件（RETROSPECTIVE.md / opt_log.md / integration_log.md / 状态文件 / 时间线事件流 / 修订与调试历史）蒸馏价值点，分类（D 实测数据 / P 模式方法 / R 流程规则 / C 案例索引），查重与冲突消解后按分级治理合入（Tier 0 自动 / Tier 1 二次独立证据 / Tier 2 人工审批）或入队 .agents/evolution/queue.md。触发：蒸馏价值点、合入进化提案、evolve、self-evolution、mode=apply。"
+description: "TileLang-Op-Conductor 自进化机制执行 skill，由 tilelang-skill-evolver 调用。任务终态从任务工件（RETROSPECTIVE.md / SESSION_TIMING_ANALYSIS.md / opt_log.md / integration_log.md / 状态文件 / 时间线事件流 / 修订与调试历史）蒸馏价值点，分类（D 实测数据 / P 模式方法 / R 流程规则 / C 案例索引），查重与冲突消解后按分级治理合入（Tier 0 自动 / Tier 1 二次独立证据 / Tier 2 人工审批）或入队 .agents/evolution/queue.md。触发：蒸馏价值点、合入进化提案、evolve、self-evolution、mode=apply。"
 ---
 
 # TileLang-Op-Conductor 自进化（价值点蒸馏与合入）
@@ -35,7 +35,7 @@ description: "TileLang-Op-Conductor 自进化机制执行 skill，由 tilelang-s
 | 终态 `phase` / `failure_reason` | `DONE` 或 `FAILED`；FAILED 任务是高价值蒸馏源（根因档案） |
 | `project_name` / `op_name` | standalone / plain / optimize 场景的算子目录定位 |
 | `op_slug` + 函数列表 | harness 场景：逐函数算子目录 `examples/{op_slug}/{func}/` |
-| 工件路径清单 | `RETROSPECTIVE.md`（Stage 1/2/3/5 复盘）、`perf_opt/opt_log.md`（Stage 4 复盘）、`perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 设计层发现，D 类优先）、`integration_log.md`、`history_version/`、`.stage_state.json` / `.migration_state.json`、`.task_timeline.jsonl`（statectl 事件流：每次迁移一行 `ts/action/stage/subagent/mode/verdict/duration_s`——失败根因链一手输入；`statectl timeline-summary` 可预汇总）（**全部只读**） |
+| 工件路径清单 | `RETROSPECTIVE.md`（Stage 1/2/3/5 复盘）、`SESSION_TIMING_ANALYSIS.md`（harness Stage 5 后基于 OpenCode session 日志生成，存在时必读）、`perf_opt/opt_log.md`（Stage 4 复盘）、`perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 设计层发现，D 类优先）、`integration_log.md`、`history_version/`、`.stage_state.json` / `.migration_state.json`、`.task_timeline.jsonl`（statectl 事件流：每次迁移一行 `ts/action/stage/subagent/mode/verdict/duration_s`——失败根因链一手输入；`statectl timeline-summary` 可预汇总）（**全部只读**） |
 
 ### apply 模式（conductor 传入）
 
@@ -48,7 +48,7 @@ description: "TileLang-Op-Conductor 自进化机制执行 skill，由 tilelang-s
 
 ### Phase 0：读取上下文
 
-1. Read conductor 传入的全部任务工件（harness 场景逐函数读取；optimize 场景无 `RETROSPECTIVE.md`，复盘在 `opt_log.md` 的 `Skill Retrospective` 章节）。
+1. Read conductor 传入的全部任务工件（harness 场景逐函数读取，并读取 op 级 `SESSION_TIMING_ANALYSIS.md`；optimize 场景无 `RETROSPECTIVE.md`，复盘在 `opt_log.md` 的 `Skill Retrospective` 章节）。
 2. Read pattern-library [INDEX.md](../tilelang-op-optimize/references/pattern-library/INDEX.md)（条目索引 + 预算现状——K-2 渐进披露后不再全文读单文件；本次蒸馏候选涉及的条目按索引精读对应主题文件，可用 `python3 .agents/tools/kb_search.py "<候选主题>"` 辅助查重定位）。
 3. Read `.agents/evolution/queue.md` 全部条目（查重基准 + Tier 1 确认计数基准）。
 4. Read [references/distillation-rules.md](references/distillation-rules.md)（信号→价值点映射、分类判定树、证据三件套、防过拟合红线）与 [references/merge-policy.md](references/merge-policy.md)（分级治理矩阵、五种 delta、冲突消解、预算与 consolidate、git 快照规则）。
@@ -58,6 +58,7 @@ description: "TileLang-Op-Conductor 自进化机制执行 skill，由 tilelang-s
 按 [distillation-rules.md](references/distillation-rules.md) 的「信号 → 价值点」映射逐源提取：
 
 - `RETROSPECTIVE.md` 各 Stage 章节（Skill Flow Issues / Value Point Proposals / Transferable Lessons）——首选来源，已由各 Stage Subagent 半结构化产出；
+- `SESSION_TIMING_ANALYSIS.md`（存在时必读）——日志证实的耗时事实可形成 D 类候选；可跨任务复用的提速方法形成 P 类候选；流程调整建议形成 R 类候选。无法由日志证实或标为 `N/A` 的内容不得作为实测证据；
 - `opt_log.md` 的 Skill Retrospective 章节 + 实验数据（新实测代价 / 新模式 / 证伪更正）；
 - `perf_feedback.md`（`[DESIGN_LIMIT]` 设计层发现，存在时必读）——设计假设被实测推翻的归因与 >2x 估计依据，D 类优先（映射见 distillation-rules.md §2.2a）；
 - `integration_log.md` 的调试历史（集成陷阱、脚本缺陷）；

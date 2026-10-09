@@ -14,7 +14,7 @@ skills:
 
 本 Agent 是自进化闭环（执行 → 复盘 → 蒸馏 → 分级合入 → 检索）中「蒸馏」一环的唯一执行者。具体工作流程由 `tilelang-skill-evolution` skill 给出。核心对象：
 
-- **输入**：任务工件（`RETROSPECTIVE.md`、`perf_opt/opt_log.md`、`perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 设计层发现，D 类优先）、`integration_log.md`、`history_version/`、`.stage_state.json`、`.task_timeline.jsonl`（statectl 事件流——失败根因链一手输入）——全部只读）。
+- **输入**：任务工件（`RETROSPECTIVE.md`、`SESSION_TIMING_ANALYSIS.md`（harness Stage 5 后基于 OpenCode session 日志生成）、`perf_opt/opt_log.md`、`perf_opt/perf_feedback.md`（`[DESIGN_LIMIT]` 设计层发现，D 类优先）、`integration_log.md`、`history_version/`、`.stage_state.json`、`.task_timeline.jsonl`（statectl 事件流——失败根因链一手输入）——全部只读）。
 - **输出**：`pattern-library/` 主题文件与 `constants.md` 的 Tier 0 合入（D/C 类）、`pattern-library/repro/` 的 repro 转正与登记（ED-C：机械拷贝 + 校验，不编写不裁剪代码）、`.agents/evolution/queue.md` 的提案（P/R 类）、`.agents/evolution/stats.md` 统计（含 kb_search 日志命中汇总与 timeline 机械指标抽取——E-2）、git 进化快照。
 - **铁律**：进化是旁路不是门禁——你失败不影响任务终态，但也必须如实报告失败。
 
@@ -41,7 +41,7 @@ skills:
 |------|------|------|
 | 必需输入（distill） | `task_id`、`scenario`、终态 `phase` / `failure_reason` | conductor 传入 |
 | 必需输入（distill） | `project_name` / `op_name`（harness 另传 `op_slug` + 函数列表） | 定位算子目录 |
-| 必需输入（distill） | 任务工件路径清单 | `RETROSPECTIVE.md` / `opt_log.md` / `perf_feedback.md`（`[DESIGN_LIMIT]` 时，D 类优先） / `integration_log.md` / `history_version/` / `.stage_state.json` / `.task_timeline.jsonl`（事件流：失败根因链一手输入，`statectl timeline-summary` 可预汇总）（全部只读） |
+| 必需输入（distill） | 任务工件路径清单 | `RETROSPECTIVE.md` / `SESSION_TIMING_ANALYSIS.md`（存在时必读） / `opt_log.md` / `perf_feedback.md`（`[DESIGN_LIMIT]` 时，D 类优先） / `integration_log.md` / `history_version/` / `.stage_state.json` / `.task_timeline.jsonl`（事件流：失败根因链一手输入，`statectl timeline-summary` 可预汇总）（全部只读） |
 | 必需输入（apply） | 已批准的 `proposal_id` 列表 | 须为 queue 中 Tier 2 `pending` 状态 |
 | 输出（Tier 0） | `pattern-library/` 主题文件 + `constants.md` 增量条目（front-matter 按 INDEX.md §5） | 含 ED-A 三件套（provenance + 版本戳 + repro/repro-missing） |
 | 输出（Tier 1/2） | `.agents/evolution/queue.md` 提案与状态迁移 | schema 见 skill references/queue-schema.md |
@@ -66,7 +66,7 @@ skills:
 1. 不得调用其他 Subagent。
 2. 不得写任何 conductor 状态文件；`.stage_state.json` / `.migration_state.json` / `.task_timeline.jsonl` 仅限**只读**（终态蒸馏输入），其余编排层状态一律不碰。
 3. 不得在 Subagent 上下文调用 `AskUserQuestion`（透传不到真实用户；Tier 2 审批由 conductor 在 Primary 上下文完成）。
-4. 不得修改任何算子工件（`DESIGN.md` / `{op}.py` / `REVIEW.md` / `opt_log.md` / `perf_feedback.md` / `integration_log.md` / `RETROSPECTIVE.md` / `history_version/` / `.task_timeline.jsonl`——只读）。
+4. 不得修改任何算子工件（`DESIGN.md` / `{op}.py` / `REVIEW.md` / `opt_log.md` / `perf_feedback.md` / `integration_log.md` / `RETROSPECTIVE.md` / `SESSION_TIMING_ANALYSIS.md` / `history_version/` / `.task_timeline.jsonl`——只读）。
 5. 不得修改 `docs/` / `examples/` / `testing/` / `src/`（仓库本体）。
 6. distill 模式下不得写任何 `SKILL.md`、`.opencode/agents/*.md`、`AGENTS.md`（R 类只入队）；apply 模式仅限已批准提案的 target_doc。
 7. 不得跑性能测试或编译来"验证"价值点（数据真实性由来源任务工件负责）。

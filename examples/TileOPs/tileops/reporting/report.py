@@ -24,6 +24,30 @@ def _fmt_with_suffix(value: Any, suffix: str, digits: int = 4) -> str:
     return "N/A" if value is None else f"{_fmt(value, digits)}{suffix}"
 
 
+def _format_duration(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    milliseconds = round(float(value) * 1000)
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, millis = divmod(remainder, 1000)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}.{millis:03d}s"
+
+
+def _timing_enabled(run: dict[str, Any]) -> bool:
+    return (run.get("session_timing") or {}).get("enabled") is True
+
+
+def _operator_timing(run: dict[str, Any], operator: Any) -> dict[str, Any]:
+    records = (run.get("session_timing") or {}).get("operators") or {}
+    record = records.get(str(operator))
+    return record if isinstance(record, dict) else {}
+
+
 def _fmt_rate(value: Any) -> str:
     return "N/A" if not isinstance(value, (int, float)) else f"{value:.1%}"
 
@@ -239,6 +263,16 @@ def render_markdown(run: dict[str, Any]) -> str:
     summary = run.get("summary") or {}
     lines = [f"# TileOPs Evaluation Report: {run.get('operator', 'unknown')}", ""]
     lines.extend(_setup_tables_markdown(run))
+    analysis_header = (
+        "| Operator | Correctness | Avg Max Abs Error | Performance Shapes | Ratio Range |"
+    )
+    analysis_rule = "|---|---:|---:|---:|---:|"
+    if _timing_enabled(run):
+        analysis_header = (
+            "| Operator | Total Time | Correctness | Avg Max Abs Error | "
+            "Performance Shapes | Ratio Range |"
+        )
+        analysis_rule = "|---|---:|---:|---:|---:|---:|"
     lines.extend(
         [
             "## Results Overview / 结果总览",
@@ -250,13 +284,17 @@ def render_markdown(run: dict[str, Any]) -> str:
             "",
             "## Operator Analysis / 算子分析",
             "",
-            "| Operator | Correctness | Avg Max Abs Error | Performance Shapes | Ratio Range |",
-            "|---|---:|---:|---:|---:|",
+            analysis_header,
+            analysis_rule,
         ]
     )
     for operator in run.get("operators", []):
+        timing_cell = ""
+        if _timing_enabled(run):
+            timing = _operator_timing(run, operator.get("operator"))
+            timing_cell = f"| {_format_duration(timing.get('total_duration_s'))} "
         lines.append(
-            f"| {_md_cell(operator.get('operator'))} | {_fmt_correctness(operator)} | "
+            f"| {_md_cell(operator.get('operator'))} {timing_cell}| {_fmt_correctness(operator)} | "
             f"{_fmt_scientific(operator.get('avg_max_abs_err'))} | "
             f"{operator.get('performance_cases', 0)} | "
             f"{_fmt_range(operator.get('ratio_range'), '%', 2)} |"
@@ -274,10 +312,37 @@ def render_markdown(run: dict[str, Any]) -> str:
     for operator in run.get("operators", []):
         name = operator.get("operator")
         cases = [case for case in perf_cases if case.get("operator") == name]
+        lines.extend([f"### {name}", ""])
+        if _timing_enabled(run):
+            timing = _operator_timing(run, name)
+            lines.extend(
+                [
+                    "<details>",
+                    f"<summary>Session Timing / Session 耗时 — {_format_duration(timing.get('total_duration_s'))}</summary>",
+                    "",
+                ]
+            )
+            breakdown = timing.get("breakdown") or []
+            if breakdown:
+                lines.extend(
+                    [
+                        "| Phase / 环节 | Duration / 耗时 | Ratio / 占比 | Detail / 说明 |",
+                        "|---|---:|---:|---|",
+                    ]
+                )
+                lines.extend(
+                    f"| {_md_cell(row.get('name'))} | {_format_duration(row.get('duration_s'))} | "
+                    f"{_fmt_with_suffix(row.get('ratio_percent'), '%', 2)} | "
+                    f"{_md_cell(row.get('detail'))} |"
+                    for row in breakdown
+                )
+            else:
+                lines.append(
+                    f"> Timing data unavailable: {_md_cell(timing.get('reason') or 'N/A')}"
+                )
+            lines.extend(["", "</details>", ""])
         lines.extend(
             [
-                f"### {name}",
-                "",
                 "| Label | Latency (us) | Ratio (%) | Shape / Parameters | DType | Mode | Kernel | Bandwidth (TB/s) |",
                 "|---|---:|---:|---|---|---|---|---:|",
             ]
@@ -385,17 +450,27 @@ def _operator_analysis_rows(run: dict[str, Any]) -> str:
     rows = []
     for index, operator in enumerate(run.get("operators", []), 1):
         rate = operator.get("pass_rate")
+        timing_cell = ""
+        if _timing_enabled(run):
+            timing = _operator_timing(run, operator.get("operator"))
+            timing_cell = (
+                f'<td class="number strong">{_format_duration(timing.get("total_duration_s"))}</td>'
+            )
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
             f'<td class="col-name"><a class="case-link" href="#operator-{index}">{html.escape(str(operator.get("operator")))}</a></td>'
+            f"{timing_cell}"
             f'<td class="score-cell {_score_class(rate, high=0.8, mid=0.4)}">{html.escape(_fmt_correctness(operator))}</td>'
             f'<td class="number">{_fmt_scientific(operator.get("avg_max_abs_err"))}</td>'
             f"<td>{operator.get('performance_cases', 0)}</td>"
             f"<td>{html.escape(_fmt_range(operator.get('ratio_range'), '%', 2))}</td>"
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="6" class="empty">No operator records</td></tr>'
+    columns = 7 if _timing_enabled(run) else 6
+    return "".join(rows) or (
+        f'<tr><td colspan="{columns}" class="empty">No operator records</td></tr>'
+    )
 
 
 def _performance_rows(cases: list[dict[str, Any]], operator_index: int) -> str:
@@ -455,6 +530,40 @@ def _case_details(cases: list[dict[str, Any]], operator_index: int) -> str:
     return "".join(entries)
 
 
+def _session_timing_details(run: dict[str, Any], name: Any, operator_index: int) -> str:
+    if not _timing_enabled(run):
+        return ""
+    timing = _operator_timing(run, name)
+    breakdown = timing.get("breakdown") or []
+    if breakdown:
+        rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('name') or 'N/A'))}</td>"
+            f'<td class="number">{_format_duration(row.get("duration_s"))}</td>'
+            f'<td class="number">{_fmt_with_suffix(row.get("ratio_percent"), "%", 2)}</td>'
+            f"<td>{html.escape(str(row.get('detail') or ''))}</td>"
+            "</tr>"
+            for row in breakdown
+        )
+        body = (
+            '<div class="table-wrap"><table><thead><tr><th>Phase / 环节</th>'
+            "<th>Duration / 耗时</th><th>Ratio / 占比</th><th>Detail / 说明</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    else:
+        reason = html.escape(str(timing.get("reason") or "N/A"))
+        body = f'<p class="empty">Timing data unavailable: {reason}</p>'
+    return (
+        f'<details class="case-detail timing-detail" id="timing-{operator_index}">'
+        "<summary>"
+        '<span class="case-index">Session Timing / Session 耗时</span>'
+        f"<strong>{_format_duration(timing.get('total_duration_s'))}</strong>"
+        f"<span>{html.escape(str(timing.get('status') or 'N/A'))}</span>"
+        "</summary>"
+        f'<div class="detail-grid">{body}</div></details>'
+    )
+
+
 def _operator_details_section(run: dict[str, Any]) -> str:
     perf_cases = run.get("performance", {}).get("cases", [])
     blocks = []
@@ -464,6 +573,7 @@ def _operator_details_section(run: dict[str, Any]) -> str:
         blocks.append(
             f'<div class="operator-block" id="operator-{operator_index}">'
             f"<h4>4.{operator_index} {html.escape(str(name))}</h4>"
+            f"{_session_timing_details(run, name, operator_index)}"
             '<div class="table-wrap"><table>'
             f"<caption>Table 4.{operator_index}. Per-shape performance results</caption>"
             "<thead><tr><th>Label</th><th>Latency (us)</th><th>Ratio</th>"
@@ -557,6 +667,9 @@ def render_html(run: dict[str, Any]) -> str:
         "{{OPERATOR_COUNT}}": str(summary.get("operator_count", 0)),
         "{{TOTAL_CASES}}": str(summary.get("total_cases", 0)),
         "{{FAILED_CASES}}": str(summary.get("failed_cases", 0)),
+        "{{TIMING_ANALYSIS_HEADER}}": (
+            "<th>Total Time / 总时间</th>" if _timing_enabled(run) else ""
+        ),
         "{{OPERATOR_ANALYSIS_ROWS}}": _operator_analysis_rows(run),
         "{{OPERATOR_DETAILS_SECTION}}": _operator_details_section(run),
         "{{DIAGNOSTICS_SECTION}}": _alert_section(run),

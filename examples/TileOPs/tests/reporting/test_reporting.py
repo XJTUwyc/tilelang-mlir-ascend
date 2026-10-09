@@ -4,9 +4,11 @@ from pathlib import Path
 from tileops.benchmark.benchmark_base import BenchmarkReport
 from tileops.benchmark.msprof import _parse_op_basic_info
 from tileops.reporting.analyzer import analyze_run
+from tileops.reporting.cli import _parser
 from tileops.reporting.collector import parse_junit_report
 from tileops.reporting.report import write_reports
 from tileops.reporting.runner import resolve_operator, run_operator
+from tileops.reporting.session_timing import attach_session_timing, parse_session_timing
 
 
 def test_parse_junit_report_preserves_properties(tmp_path):
@@ -75,7 +77,7 @@ def test_analyzer_preserves_per_shape_roofline_ratio():
             {
                 "operator": "DemoOp",
                 "case_id": "case-1",
-                "label": "smoke-16",
+                "label": "full-16",
                 "tag": "tileops",
                 "params": {"shape": [16], "dtype": "float16"},
                 "result": {
@@ -105,11 +107,61 @@ def test_analyzer_preserves_per_shape_roofline_ratio():
 
     case = run["performance"]["cases"][0]
     assert case["roofline_utilization_percent"] == 62.5
-    assert case["label"] == "smoke-16"
+    assert case["label"] == "full-16"
     assert "baselines" not in case
     assert "average_roofline_utilization_percent" not in run["summary"]
     assert "speedup_range" not in run["operators"][0]
     assert run["operators"][0]["ratio_range"] == {"min": 62.5, "max": 62.5}
+
+
+def test_analyzer_ignores_non_tileops_performance_records():
+    benchmark = {
+        "status": "present",
+        "profiling_mode_requested": "msprof",
+        "records": [
+            {
+                "operator": "DemoOp",
+                "case_id": "tileops-case",
+                "label": "full-16",
+                "tag": "tileops",
+                "params": {"shape": [16], "dtype": "float16"},
+                "result": {"latency_us": 10.0, "prof_mode": "msprof"},
+            },
+            {
+                "operator": "DemoOp",
+                "case_id": "torch-case-with-different-params-hash",
+                "label": "full-16",
+                "tag": "torch",
+                "params": {
+                    "shape": [16],
+                    "dtype": "float16",
+                    "result_bl": {"latency_us": 8.0},
+                },
+                "result": {"latency_us": 8.0, "prof_mode": "events"},
+            },
+        ],
+    }
+    correctness = {
+        "status": "passed",
+        "tests": 1,
+        "passed": 1,
+        "failed": 0,
+        "errors": 0,
+        "cases": [],
+    }
+
+    run = analyze_run(
+        operator="DemoOp",
+        correctness=correctness,
+        correctness_exit_code=0,
+        benchmark=benchmark,
+        benchmark_exit_code=0,
+    )
+
+    assert run["status"] == "passed"
+    assert run["summary"]["case_count"] == 1
+    assert [case["case_id"] for case in run["performance"]["cases"]] == ["tileops-case"]
+    assert not any("missing tileops candidate record" in warning for warning in run["warnings"])
 
 
 def test_analyzer_rejects_candidate_profiler_fallback():
@@ -145,6 +197,50 @@ def test_analyzer_rejects_candidate_profiler_fallback():
     assert run["status"] == "partial"
     assert run["summary"]["profiler_fallback_count"] == 1
     assert "baselines" not in run["performance"]["cases"][0]
+
+
+def test_analyzer_excludes_legacy_smoke_performance_records():
+    benchmark = {
+        "status": "present",
+        "profiling_mode_requested": "msprof",
+        "records": [
+            {
+                "operator": "DemoOp",
+                "case_id": "smoke-case",
+                "label": "demo-smoke",
+                "tag": "tileops",
+                "params": {},
+                "result": {"latency_us": 1.0, "prof_mode": "msprof"},
+            },
+            {
+                "operator": "DemoOp",
+                "case_id": "full-case",
+                "label": "demo-full",
+                "tag": "tileops",
+                "params": {},
+                "result": {"latency_us": 2.0, "prof_mode": "msprof"},
+            },
+        ],
+    }
+    correctness = {
+        "status": "passed",
+        "tests": 1,
+        "passed": 1,
+        "failed": 0,
+        "errors": 0,
+        "cases": [],
+    }
+
+    run = analyze_run(
+        operator="DemoOp",
+        correctness=correctness,
+        correctness_exit_code=0,
+        benchmark=benchmark,
+        benchmark_exit_code=0,
+    )
+
+    assert run["summary"]["case_count"] == 1
+    assert [case["label"] for case in run["performance"]["cases"]] == ["demo-full"]
 
 
 def test_benchmark_report_writes_structured_json(tmp_path, monkeypatch):
@@ -238,7 +334,7 @@ def test_write_reports_creates_all_formats(tmp_path):
                 {
                     "operator": "DemoOp",
                     "case_id": "DemoOp-0123456789ab",
-                    "label": "smoke-16x32",
+                    "label": "full-16x32",
                     "params": {"shape": [16, 32], "dtype": "float16"},
                     "prof_mode": "msprof",
                     "latency_us": 8.5,
@@ -271,7 +367,7 @@ def test_write_reports_creates_all_formats(tmp_path):
     assert "N/Ax" not in markdown
     assert "Shape / Parameters" in html
     assert "<th>Label</th><th>Latency (us)</th><th>Ratio</th>" in html
-    assert "smoke-16x32" in html
+    assert "full-16x32" in html
     assert "[16, 32]" in html
     assert "<th>Operator</th><th>Correctness</th><th>Avg Max Abs Error</th>" in html
     assert "100.0% (1/1)" in html
@@ -297,7 +393,7 @@ def test_runner_gates_benchmark_and_writes_report(tmp_path, monkeypatch):
 
     def fake_run_pytest(**kwargs):
         target = kwargs["target"]
-        calls.append(target)
+        calls.append((target, kwargs["pytest_args"]))
         Path(kwargs["junit_path"]).write_text(
             '<testsuite tests="1"><testcase classname="demo" name="ok"/></testsuite>',
             encoding="utf-8",
@@ -340,7 +436,10 @@ def test_runner_gates_benchmark_and_writes_report(tmp_path, monkeypatch):
         root=tmp_path,
     )
 
-    assert calls == ["test_demo.py", "bench_demo.py"]
+    assert calls == [
+        ("test_demo.py", []),
+        ("bench_demo.py", ["-m", "not smoke"]),
+    ]
     assert exit_code == 0
     assert run["status"] == "passed"
     assert run["summary"]["benchmark_tests"] == 1
@@ -377,6 +476,56 @@ def test_runner_skips_benchmark_after_correctness_failure(tmp_path, monkeypatch)
     assert exit_code == 1
     assert run["status"] == "failed"
     assert run["summary"]["benchmark_requested"] is False
+
+
+def test_runner_combines_user_marker_expression_with_smoke_exclusion(tmp_path, monkeypatch):
+    (tmp_path / "test_demo.py").write_text("", encoding="utf-8")
+    (tmp_path / "bench_demo.py").write_text("", encoding="utf-8")
+    calls = []
+
+    def fake_run_pytest(**kwargs):
+        calls.append((kwargs["target"], kwargs["pytest_args"]))
+        Path(kwargs["junit_path"]).write_text(
+            '<testsuite tests="1"><testcase classname="demo" name="ok"/></testsuite>',
+            encoding="utf-8",
+        )
+        if kwargs["target"] == "bench_demo.py":
+            Path(kwargs["env"]["TILEOPS_BENCHMARK_REPORT_PATH"]).with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "profiling_mode_requested": "events",
+                        "records": [
+                            {
+                                "operator": "ExternalOp",
+                                "case_id": "case-1",
+                                "label": "full-case",
+                                "tag": "tileops",
+                                "params": {},
+                                "result": {"latency_us": 1.0, "prof_mode": "events"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return 0, ["pytest", kwargs["target"]]
+
+    monkeypatch.setattr("tileops.reporting.runner._run_pytest", fake_run_pytest)
+
+    run_operator(
+        "ExternalOp",
+        test_file="test_demo.py",
+        benchmark_file="bench_demo.py",
+        prof_mode="events",
+        pytest_args=["-m", "full or nightly", "-q"],
+        root=tmp_path,
+    )
+
+    assert calls == [
+        ("test_demo.py", ["-m", "full or nightly", "-q"]),
+        ("bench_demo.py", ["-q", "-m", "(full or nightly) and not smoke"]),
+    ]
 
 
 def test_all_mode_resolves_pytest_directories():
@@ -547,3 +696,192 @@ def test_benchmark_failures_are_preserved_in_diagnostics(tmp_path):
     assert run["status"] == "partial"
     assert "Benchmark" in html
     assert "device error" in html
+
+
+def _write_session_timing(path: Path, operator: str, total: float = 3661.25):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "<!-- TILEOPS_SESSION_TIMING_V1",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operator": operator,
+                        "total_duration_s": total,
+                        "breakdown": [
+                            {
+                                "name": "Stage 5 integration",
+                                "duration_s": 61.25,
+                                "ratio_percent": 1.67,
+                                "detail": "OpenCode session log",
+                            }
+                        ],
+                    }
+                ),
+                "-->",
+                "# Session timing analysis",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_parse_session_timing_validates_operator_and_values(tmp_path):
+    source = tmp_path / "SESSION_TIMING_ANALYSIS.md"
+    _write_session_timing(source, "DemoOp")
+
+    parsed = parse_session_timing(source, "DemoOp")
+    mismatch = parse_session_timing(source, "OtherOp")
+
+    assert parsed["status"] == "available"
+    assert parsed["total_duration_s"] == 3661.25
+    assert parsed["breakdown"][0]["name"] == "Stage 5 integration"
+    assert mismatch["status"] == "invalid"
+    assert "operator mismatch" in mismatch["reason"]
+
+
+def test_session_timing_auto_discovery_supports_multi_operator_reports(tmp_path):
+    root = tmp_path / "TileOPs"
+    root.mkdir()
+    metadata = root / "tileops" / "kernels" / "demo" / "alpha" / ".migration_meta.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps({"op_name": "AlphaOp", "op_slug": "alpha_task"}), encoding="utf-8"
+    )
+    _write_session_timing(tmp_path / "alpha_task" / "SESSION_TIMING_ANALYSIS.md", "AlphaOp")
+    run = {
+        "operators": [{"operator": "AlphaOp"}, {"operator": "BetaOp"}],
+    }
+    catalog = [
+        {"name": "AlphaOp", "kernel": "tileops/kernels/demo/wrong/wrong.py"},
+        {"name": "BetaOp", "kernel": "tileops/kernels/demo/beta/beta.py"},
+    ]
+
+    attach_session_timing(run, root=root, operator_catalog=catalog, enabled=True)
+
+    records = run["session_timing"]["operators"]
+    assert records["AlphaOp"]["status"] == "available"
+    assert records["BetaOp"]["status"] == "missing"
+    assert records["BetaOp"]["total_duration_s"] is None
+
+
+def test_optional_session_timing_rendering_and_na_fallback(tmp_path):
+    run = {
+        "operator": "all",
+        "status": "passed",
+        "metadata": {},
+        "setup": {},
+        "summary": {
+            "operator_count": 2,
+            "total_cases": 0,
+            "passed_cases": 0,
+            "failed_cases": 0,
+            "case_count": 0,
+        },
+        "operators": [
+            {
+                "operator": "AlphaOp",
+                "cases": 0,
+                "passed": 0,
+                "pass_rate": None,
+                "performance_cases": 0,
+            },
+            {
+                "operator": "BetaOp",
+                "cases": 0,
+                "passed": 0,
+                "pass_rate": None,
+                "performance_cases": 0,
+            },
+        ],
+        "performance": {"cases": []},
+        "correctness": {"cases": []},
+        "benchmark_tests": {"cases": []},
+        "warnings": [],
+        "session_timing": {
+            "enabled": True,
+            "operators": {
+                "AlphaOp": {
+                    "status": "available",
+                    "total_duration_s": 3661.25,
+                    "breakdown": [
+                        {
+                            "name": "Integration",
+                            "duration_s": 61.25,
+                            "ratio_percent": 1.67,
+                            "detail": "session log",
+                        }
+                    ],
+                },
+                "BetaOp": {
+                    "status": "missing",
+                    "total_duration_s": None,
+                    "breakdown": [],
+                    "reason": "SESSION_TIMING_ANALYSIS.md not found",
+                },
+            },
+        },
+    }
+
+    paths = write_reports(run, tmp_path)
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+    html = paths["html"].read_text(encoding="utf-8")
+
+    assert "| Operator | Total Time |" in markdown
+    assert "1h01m01s" in markdown
+    assert "Timing data unavailable: SESSION_TIMING_ANALYSIS.md not found" in markdown
+    assert "Total Time / 总时间" in html
+    assert "Session Timing / Session 耗时" in html
+    assert "1h01m01s" in html
+    assert "SESSION_TIMING_ANALYSIS.md not found" in html
+
+
+def test_session_timing_disabled_preserves_current_report_layout(tmp_path):
+    run = {
+        "operator": "DemoOp",
+        "status": "passed",
+        "metadata": {},
+        "setup": {},
+        "summary": {
+            "operator_count": 1,
+            "total_cases": 0,
+            "passed_cases": 0,
+            "failed_cases": 0,
+            "case_count": 0,
+        },
+        "operators": [
+            {
+                "operator": "DemoOp",
+                "cases": 0,
+                "passed": 0,
+                "pass_rate": None,
+                "performance_cases": 0,
+            }
+        ],
+        "performance": {"cases": []},
+        "correctness": {"cases": []},
+        "benchmark_tests": {"cases": []},
+        "warnings": [],
+    }
+
+    paths = write_reports(run, tmp_path)
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+    html = paths["html"].read_text(encoding="utf-8")
+
+    assert "Total Time" not in markdown
+    assert "Session Timing" not in markdown
+    assert "Total Time / 总时间" not in html
+    assert "Session Timing / Session 耗时" not in html
+
+
+def test_session_timing_flag_is_available_for_run_and_render():
+    parser = _parser()
+
+    run_args = parser.parse_args(["run", "--all", "--with-session-timing"])
+    render_args = parser.parse_args(
+        ["render", "reports/tileops/demo/run.json", "--with-session-timing"]
+    )
+
+    assert run_args.with_session_timing is True
+    assert render_args.with_session_timing is True

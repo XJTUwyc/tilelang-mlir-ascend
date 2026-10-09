@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any
@@ -23,10 +24,23 @@ def _profile_validity(result: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
+def _is_smoke_record(record: dict[str, Any]) -> bool:
+    """Recognize legacy smoke records so they never leak into performance reports."""
+    params = record.get("params") or {}
+    values = (record.get("label"), params.get("label"))
+    return any(
+        isinstance(value, str)
+        and re.search(r"(?:^|[^a-z0-9])smoke(?:$|[^a-z0-9])", value, re.IGNORECASE)
+        for value in values
+    )
+
+
 def _analyze_performance(benchmark: dict[str, Any]) -> tuple[list[dict], dict, list[str]]:
     requested_mode = benchmark.get("profiling_mode_requested")
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for record in benchmark.get("records", []):
+        if not str(record.get("tag", "")).startswith("tileops"):
+            continue
         grouped[(record.get("operator", "unknown"), record.get("case_id", "unknown"))].append(
             record
         )
@@ -38,6 +52,8 @@ def _analyze_performance(benchmark: dict[str, Any]) -> tuple[list[dict], dict, l
     invalid_profile_count = 0
 
     for (operator, case_id), records in grouped.items():
+        if any(_is_smoke_record(record) for record in records):
+            continue
         candidate = next(
             (record for record in records if str(record.get("tag", "")).startswith("tileops")),
             None,

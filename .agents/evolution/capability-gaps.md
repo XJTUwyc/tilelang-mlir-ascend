@@ -476,6 +476,107 @@ created_by: ssd_chunk_scan/_ssd_chunk_scan_fwd_kernel Stage 4（distill 登记�
 last_seen: ssd_chunk_scan-_ssd_chunk_scan_fwd_kernel-20260917T035420Z Stage 4（2026-09-17）
 ```
 
+### CG-2026-0014
+
+```yaml
+gap_id: CG-2026-0014
+layer: TileLangIR pass（向量化/分块）
+capability: >-
+  multitile（num_tiles>1 的 T.serial tile 循环）+ bm>1 组合触发编译器 SIGSEGV
+  （rc 139，无报错文本）。触发矩阵：bm=1 任意 tile 数 ✓ / bm>1 单 tile ✓ /
+  bm>1 多 tile ✗。本条目按 DESIGN.md §9.4-R9 补录（前次任务已用该 ID 登记
+  但条目丢失；源 repro .py 已清理仅存 repro/__pycache__ pyc）。
+blocked_algo: >-
+  argmax/_argreduce_kernel tiled 路径被迫 bm=1（DESIGN §5.2 强制）——lm-head 类
+  小 M 负载核利用率被钉死在 M/48（4/48），是 C6 N-split 结构（本库 PL-1.20）
+  的存在动因；Stage 4 实测翻转后 lm-head 2.20x/2.60x。
+evidence:
+  - repro/__pycache__/TRAP-multitile-bm-gt1-segfault.cpython-311.pyc（前次任务，
+    2026-09-23；触发矩阵见 DESIGN.md examples/argmax/_argreduce_kernel §9.1-C-5）。
+  - DESIGN.md §9.1-C-5 / §9.2-R3（本任务引用其结论未复现崩溃本身）。
+workaround: tiled 路径强制 bm=1（工厂期保证）；小 M 大 N 负载改 N-split 两段 kernel。
+occurrences: 1  # 前次任务识别；本链 Stage 1（DESIGN §9.4-R9）发现登记丢失并补录、Stage 4 引用未复现崩溃本身
+tasks: [argmax-_argreduce_kernel-stage3-前次任务, argmax-_argreduce_kernel-20260924T031005Z]
+toolchain_stamp: tilelang 0.1.2 (dev root build 2026-09-24) / CANN 8.5.0 / Ascend910B2C
+status: open
+created_by: argmax/_argreduce_kernel DESIGN §9.4 补录（2026-09-28）
+last_seen: argmax-_argreduce_kernel-20260924T031005Z（2026-09-28）
+```
+
+### CG-2026-0015
+
+```yaml
+gap_id: CG-2026-0015
+layer: TileLangIR pass（npu_loop_vectorize）
+capability: >-
+  2D T.Parallel(bm,N) 融合 if_then_else 循环在 bm>=2 时整体标量化（scalar ratio
+  0.84–0.95），与操作数形态无关（(bm,1) 直接索引 / ext_brc 物化 + fragment staging
+  两变体同标量化）；bm=1 同形态正常向量化。argmax hidden-state 实测 222µs（标量化）
+  vs 链式 47µs（4.7x 差距）。
+blocked_algo: >-
+  row-reduction 族的融合候选/条件选择类 2D 循环在 bm>=2 不可用——被迫退到显式
+  向量 op 链（vbrc/vcmp/vselect，pass 数 +2）或 per-row (1,W) 展开循环（op 数
+  x bm）。跨任务影响：任何「逐元素条件 + 多行 block」形态。
+evidence:
+  - pattern-library TRAP-parallel2d-bm-ge2-scalarize（三组操作数变体对照 + msprof
+    数据 + repro/repro_parallel2d_bm2_scalarize.py，ratio 3.02 实测复现）。
+  - argmax opt_log Iteration 4 证伪更正记录（session-1 嫌疑 (a)/(b) 均被变体对照否证）。
+workaround: bm>=2 用显式向量 op 链或 per-row (1,W) 展开（PL-1.20 形态）。
+occurrences: 1
+tasks: [argmax-_argreduce_kernel-20260924T031005Z]
+toolchain_stamp: tilelang 0.1.2 (dev root build 2026-09-24) / CANN 8.5.0 / Ascend910B2C
+status: open
+created_by: argmax/_argreduce_kernel Stage 4 round 4（2026-09-28）
+last_seen: argmax-_argreduce_kernel-20260924T031005Z（2026-09-28）
+```
+
+### CG-2026-0016
+
+```yaml
+gap_id: CG-2026-0016
+layer: TileLangIR pass（向量化/codegen）
+capability: >-
+  T.arange(buf (M,W), [0,1], 0) 的索引物化按标量执行（~1ns/elem；((2,4096) 实测
+  8.56µs）。(1,N) 形态正常。另：核内重复 T.arange 写同 buffer 非幂等（放大探针
+  误编译，见 repro_arange_scalar.py docstring）。
+blocked_algo: >-
+  需要 j 索引载体的融合/链式候选构造在 bm>=2 时被迫 hoist 一份 (bm,N) fp32 缓冲
+  并付出标量物化税（hidden-state 47µs 中占 ~18%）。
+evidence:
+  - pattern-library CONST-arange-scalar-materialize（msprof 46.97→38.41µs，
+  -18.2%；节省量 8.56µs 与 8192 elem × ~1.05ns 模型吻合）。
+workaround: T.arange 于 (1,N) + vbrc 首轴广播 (1,N)→(M,N)（文档合法形态）；
+  bm=1 直接用（同形 vbrc 触发 CG-2026-0017）。
+occurrences: 1
+tasks: [argmax-_argreduce_kernel-20260924T031005Z]
+toolchain_stamp: tilelang 0.1.2 (dev root build 2026-09-24) / CANN 8.5.0 / Ascend910B2C
+status: open
+created_by: argmax/_argreduce_kernel Stage 4 round 4（2026-09-28）
+last_seen: argmax-_argreduce_kernel-20260924T031005Z（2026-09-28）
+```
+
+### CG-2026-0017
+
+```yaml
+gap_id: CG-2026-0017
+layer: BishengIR（vbrc verifier）
+capability: >-
+  T.vbrc 同形 src/dst（无尺寸差维）产出空 broadcast_dims 数组，MLIR verify 报
+  "'hivm.hir.vbrc' op have empty broadcast dims array"——语义上应等价于逐元素
+  拷贝或前端拒绝（更清晰的报错）。
+blocked_algo: 轻微：同形广播场景需改用源缓冲或 T.copy。
+evidence:
+  - pattern-library TRAP-vbrc-same-shape-empty-broadcast（stderr 诊断原文 +
+  repro/repro_vbrc_same_shape.py 断言复现）。
+workaround: 同形场景直接用源缓冲 / T.copy。
+occurrences: 1
+tasks: [argmax-_argreduce_kernel-20260924T031005Z]
+toolchain_stamp: tilelang 0.1.2 (dev root build 2026-09-24) / CANN 8.5.0 / Ascend910B2C
+status: open
+created_by: argmax/_argreduce_kernel Stage 4 round 4（2026-09-28）
+last_seen: argmax-_argreduce_kernel-20260924T031005Z（2026-09-28）
+```
+
 ### CG-2026-0008 → 已升级 recurring，条目移入下方 Recurring 区（2026-09-15 occurrences 2）
 
 ---

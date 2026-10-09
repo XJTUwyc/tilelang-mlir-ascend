@@ -88,3 +88,41 @@ repro: repro-missing
 - **UB 预算**：中转路径按 Σ(elem_bytes × buffer_count) 复算（bf16 中转 24B/elem、fp16 中转 20B/elem——VP-2026-0009 混合字节口径）。
 - **实测**（lerp 首证）：max_diff ≤1 ulp fp16（抽样 binade 4.883e-04～1.953e-03）、全量 0 violations；NaN/Inf 角点 IEEE 传播与舍入路径无关（中转后 inf-corner 逐位不变）。
 - repro：repro-missing（知识域最小 repro 待同族任务回填；两证任务内复现命令见 queue VP-2026-0002 证据链——provenance 允许失效）。
+
+---
+id: PL-1.19-scatter-col-write-amplification
+kind: pattern
+family: [reduction, elementwise]
+apis: [T.copy]
+dtype: [fp16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_strided_colblock_read.py
+---
+
+### (M,1) 列切片 UB→GM 写 42× 放大 → 扁平 chunk-major 连续写
+
+慢：`T.copy(ext_out[0:M,0:1], ws[0:M, c:c+1])`（(M,1) 目标列 × 行 stride）——每散布元素拉 128B 行：tn=256/nchunk=400 实测 UB_to_GM 400KB（真实 9.6KB，42×），mte3_ratio 0.78。快：workspace 取扁平 (nchunk*M,) chunk-major，每 chunk 一次 1D 连续写 `T.copy(ext_out[0:M], ws_flat[c*M:(c+1)*M])`（同 kernel mte3 降至 0.03–0.18）；消费端按 flat-view 重解释形状（narrow-path 先例）。写侧块连续律与 PL-1.14（跨引擎 ws）同族，此处为纯 Vector UB→GM。
+
+---
+id: PL-1.20-nsplit-perrow-partial
+kind: pattern
+family: [reduction]
+apis: [T.Kernel, T.transpose, T.vbrc]
+dtype: [fp16, bf16, fp32]
+device: 910B2C
+status: verified
+origin_task: argmax-_argreduce_kernel-20260924T031005Z
+toolchain: tilelang 0.1.2 (dev root build 2026-09-24) + CANN 8.5.0 / Ascend910B2C
+repro: repro/repro_nsplit_pattern.py
+---
+
+### C6 N-split per-row partial + transpose merge：小 M 大 N 负载 2.2–2.6×
+
+适用：M ≤ cores、N 超驻留（lm-head 类 (4,102400)）——单 kernel tiled 被 bm=1 陷阱钉死在 M 个核（4/48）。结构（慢→快关键 delta）：
+- partial：`T.Kernel(min(nchunk,cores))` + `for s in T.serial: c=cid+s*K; if c<nchunk:` + **`for r in range(M)` 展开的 (1,tn) 行链**（copy/reduce/vbrc/fused-ite/reduce_min 全部 bm=1 已验证形态——关键修复是 (M,tn) 2D 融合 ite 踩 TRAP-parallel2d-bm-ge2-scalarize；跨步列块读本身不慢，见 CONST-gm-to-ub-bw-dilution 更正记录）+ 每 chunk 两条 1D 连续 ws 写（chunk-major 扁平，消 PL-1.19 写放大）。
+- merge：单 block，ws 按 (nchunk,M) 视图读入 shared → `T.transpose(...,[1,0])` → (M,nchunk) dims=1 tie-break 链（E1 同构：vselect 命中 chunk 的已全局化 idx，min = 首现）。
+- **tn 规则（扫描实测 tn∈{1280,2048,2560,5120} → 8.58µs@2560 最优）：最大单波 nchunk ≤ cores**（tn 升序 256 倍数扫首个除数）；nchunk>cores（双波 2:1）与 nchunk≪cores（核饥饿）均劣。
+- 实测：lm-head fp16 25.90→11.78µs（2.20×）、bf16 30.61→11.75µs（2.60×）；工厂契约保持单 callable（组合层 torch.empty workspace + 双发射）。

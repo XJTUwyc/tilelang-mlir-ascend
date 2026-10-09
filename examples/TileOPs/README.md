@@ -99,6 +99,23 @@ without rerunning NPU tests:
 tileops-report render reports/tileops/<run-id>/run.json
 ```
 
+Session timing is optional and disabled by default, so reports retain their
+original layout unless ``--with-session-timing`` is passed.  When enabled, the
+reporter discovers each operator's ``examples/<op-slug>/SESSION_TIMING_ANALYSIS.md``
+through migration metadata (falling back to the manifest kernel path), validates
+its ``TILEOPS_SESSION_TIMING_V1`` block, and adds only total time plus a compact
+expandable breakdown.  Missing or invalid files render as ``N/A`` for that
+operator without affecting other operators.  This works for both single-op and
+multi-op reports:
+
+```bash
+# Rerender an existing Stage 5 report after the timing Markdown is generated
+tileops-report render reports/tileops/<run-id>/run.json --with-session-timing
+
+# Discover timing Markdown independently for every operator in an all-op run
+tileops-report run --all --prof-mode msprof --with-session-timing
+```
+
 Report runs must be serial.  Do not pass pytest-xdist ``-n`` or
 ``--numprocesses`` options: benchmark records are process-local and cannot yet be
 merged safely across workers.  The CLI rejects these options instead of producing an
