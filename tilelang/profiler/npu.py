@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import sys
 import atexit
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, TypeVar
+from typing import TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class NPUProfileConfig:
         )
 
     @classmethod
-    def from_env(cls, environment=None) -> "NPUProfileConfig":
+    def from_env(cls, environment=None) -> NPUProfileConfig:
         if environment is None:
             from tilelang.env import env as environment
 
@@ -176,9 +176,8 @@ class NPUProfilerController:
         if not config.enabled or self._finished:
             return callback()
 
-        if self._session is None:
-            if not self._start_session(config):
-                return callback()
+        if self._session is None and not self._start_session(config):
+            return callback()
 
         try:
             result = callback()

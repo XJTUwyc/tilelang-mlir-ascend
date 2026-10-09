@@ -16,8 +16,8 @@ from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
 from tilelang.profiler.npu import (
-    NPUProfileConfig,
-    npu_annotation,
+    NPUProfileConfig as NPUProfileConfig,
+    npu_annotation as npu_annotation,
 )
 from tvm import tirx
 

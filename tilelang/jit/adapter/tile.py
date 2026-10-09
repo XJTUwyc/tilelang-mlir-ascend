@@ -111,7 +111,7 @@ class TileKernelAdapter(BaseKernelAdapter):
                     if not value.is_contiguous():
                         raise ValueError(f"parameter {i} must be contiguous")
                     if device is not None and value.device != device:
-                        raise ValueError(f"all input tensors must be on the same NPU")
+                        raise ValueError("all input tensors must be on the same NPU")
                     device = value.device
                 else:
                     validate_scalar_value(self.scalar_kinds[i], value)
