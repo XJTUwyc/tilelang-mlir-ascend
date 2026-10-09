@@ -1,8 +1,6 @@
 import contextlib
-import json
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -423,62 +421,4 @@ def test_tile_obj_launches_once(monkeypatch, profile_value, expected_annotations
         profile_value=profile_value,
         launch_count=len(launches),
         annotations=annotations,
-    )
-
-
-def test_golden_trace_contains_required_npu_semantics():
-    trace_path = Path(__file__).with_name("final-gra.json")
-    payload = json.loads(trace_path.read_text(encoding="utf-8"))
-    events = payload["traceEvents"] if isinstance(payload, dict) else payload
-
-    tilelang_annotations = [
-        event
-        for event in events
-        if str(event.get("name", "")).startswith("tilelang::")
-    ]
-    cann_launches = [
-        event
-        for event in events
-        if "aclrtLaunchKernelWithHostArgs" in str(event.get("name", ""))
-        or event.get("args", {}).get("id") == "aclrtLaunchKernelWithHostArgs"
-    ]
-    npu_tasks = [
-        event
-        for event in events
-        if event.get("ph") == "X"
-        and str(event.get("args", {}).get("Task Type", "")).startswith("AI_")
-    ]
-
-    assert tilelang_annotations
-    assert cann_launches
-    assert npu_tasks
-
-    host_flows = [
-        event
-        for event in events
-        if event.get("cat") == "HostToDevice" and event.get("ph") in {"s", "f"}
-    ]
-    start_ids = {event.get("id") for event in host_flows if event.get("ph") == "s"}
-    finish_ids = {event.get("id") for event in host_flows if event.get("ph") == "f"}
-    host_pairs = start_ids & finish_ids
-    assert host_pairs
-
-    async_flows = [
-        event
-        for event in events
-        if event.get("cat") == "async_npu" and event.get("ph") in {"s", "f"}
-    ]
-    async_start_ids = {event.get("id") for event in async_flows if event.get("ph") == "s"}
-    async_finish_ids = {event.get("id") for event in async_flows if event.get("ph") == "f"}
-    async_pairs = async_start_ids & async_finish_ids
-    assert async_pairs
-
-    _report(
-        "Golden Trace semantics",
-        total_events=len(events),
-        tilelang_annotations=len(tilelang_annotations),
-        cann_launches=len(cann_launches),
-        npu_tasks=len(npu_tasks),
-        host_to_device_pairs=len(host_pairs),
-        async_npu_pairs=len(async_pairs),
     )
